@@ -1,0 +1,673 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Athena Usage Analyser - Captures and analyzes Amazon Athena usage. Deployed with security best practices for customer environments.",
+  "Metadata": {
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {
+            "default": "Monitoring Configuration"
+          },
+          "Parameters": [
+            "AthenaWorkgroups",
+            "S3BucketsToMonitor",
+            "CloudTrailBucket"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Schedule Configuration"
+          },
+          "Parameters": [
+            "AnalysisIntervalMinutes",
+            "RetentionDays"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Security Configuration"
+          },
+          "Parameters": [
+            "KMSKeyArn"
+          ]
+        }
+      ],
+      "ParameterLabels": {
+        "AthenaWorkgroups": {
+          "default": "Athena Workgroups to Monitor"
+        },
+        "S3BucketsToMonitor": {
+          "default": "S3 Buckets to Monitor"
+        },
+        "CloudTrailBucket": {
+          "default": "CloudTrail Logs Bucket (Optional)"
+        },
+        "AnalysisIntervalMinutes": {
+          "default": "Analysis Interval (Minutes)"
+        },
+        "RetentionDays": {
+          "default": "Data Retention (Days)"
+        },
+        "KMSKeyArn": {
+          "default": "KMS Key ARN (Optional)"
+        }
+      }
+    }
+  },
+  "Parameters": {
+    "AthenaWorkgroups": {
+      "Type": "String",
+      "Description": "Comma-separated list of Athena workgroup names to monitor. Use '*' to monitor all workgroups. Example: primary,analytics,reporting",
+      "Default": "*"
+    },
+    "S3BucketsToMonitor": {
+      "Type": "String",
+      "Description": "Comma-separated list of S3 bucket names related to Athena (data lakes, results). Use '*' to auto-detect Athena-related buckets. Example: my-datalake,athena-results",
+      "Default": "*"
+    },
+    "CloudTrailBucket": {
+      "Type": "String",
+      "Description": "(Optional) S3 bucket containing CloudTrail logs for deeper analysis. Leave empty to use CloudTrail API only.",
+      "Default": ""
+    },
+    "AnalysisIntervalMinutes": {
+      "Type": "Number",
+      "Description": "How often to run the analysis (in minutes)",
+      "Default": 10,
+      "MinValue": 5,
+      "MaxValue": 60
+    },
+    "RetentionDays": {
+      "Type": "Number",
+      "Description": "Number of days to retain analysis data in S3 and CloudWatch Logs",
+      "Default": 90,
+      "MinValue": 7,
+      "MaxValue": 365
+    },
+    "KMSKeyArn": {
+      "Type": "String",
+      "Description": "(Optional) ARN of KMS key for encrypting S3 bucket and CloudWatch Logs. Leave empty to use AWS managed encryption (SSE-S3).",
+      "Default": ""
+    }
+  },
+  "Conditions": {
+    "UseKMSEncryption": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "KMSKeyArn"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasCloudTrailBucket": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "CloudTrailBucket"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "AnalysisBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": {
+                  "Fn::If": [
+                    "UseKMSEncryption",
+                    "aws:kms",
+                    "AES256"
+                  ]
+                },
+                "KMSMasterKeyID": {
+                  "Fn::If": [
+                    "UseKMSEncryption",
+                    {
+                      "Ref": "KMSKeyArn"
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                }
+              },
+              "BucketKeyEnabled": {
+                "Fn::If": [
+                  "UseKMSEncryption",
+                  true,
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireOldAnalysis",
+              "Status": "Enabled",
+              "ExpirationInDays": {
+                "Ref": "RetentionDays"
+              }
+            },
+            {
+              "Id": "CleanupIncompleteUploads",
+              "Status": "Enabled",
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            },
+            {
+              "Id": "TransitionToIA",
+              "Status": "Enabled",
+              "Transitions": [
+                {
+                  "StorageClass": "STANDARD_IA",
+                  "TransitionInDays": 30
+                }
+              ]
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "CloudFormation"
+          }
+        ]
+      }
+    },
+    "AnalysisBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "AnalysisBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EnforceSSLOnly",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "AnalysisBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${AnalysisBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AnalysisLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/athena-usage-analyser/${AWS::StackName}"
+        },
+        "RetentionInDays": {
+          "Ref": "RetentionDays"
+        },
+        "KmsKeyId": {
+          "Fn::If": [
+            "UseKMSEncryption",
+            {
+              "Ref": "KMSKeyArn"
+            },
+            {
+              "Ref": "AWS::NoValue"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          }
+        ]
+      }
+    },
+    "LambdaLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-analyser"
+        },
+        "RetentionInDays": {
+          "Ref": "RetentionDays"
+        },
+        "KmsKeyId": {
+          "Fn::If": [
+            "UseKMSEncryption",
+            {
+              "Ref": "KMSKeyArn"
+            },
+            {
+              "Ref": "AWS::NoValue"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          }
+        ]
+      }
+    },
+    "LambdaExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${AWS::StackName}-lambda-role"
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          }
+        ]
+      }
+    },
+    "LambdaLogsPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "CloudWatchLogsAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "WriteLambdaLogs",
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "LambdaLogGroup",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${LambdaLogGroup.Arn}:*"
+                }
+              ]
+            },
+            {
+              "Sid": "WriteAnalysisLogs",
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "AnalysisLogGroup",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${AnalysisLogGroup.Arn}:*"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "CloudTrailPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "CloudTrailReadAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "LookupCloudTrailEvents",
+              "Effect": "Allow",
+              "Action": [
+                "cloudtrail:LookupEvents"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "CloudTrailBucketPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "HasCloudTrailBucket",
+      "Properties": {
+        "PolicyName": "CloudTrailBucketAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "ReadCloudTrailLogs",
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:aws:s3:::${CloudTrailBucket}"
+                },
+                {
+                  "Fn::Sub": "arn:aws:s3:::${CloudTrailBucket}/AWSLogs/*"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "OutputBucketPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "OutputBucketAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "WriteAnalysisOutput",
+              "Effect": "Allow",
+              "Action": [
+                "s3:PutObject"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "${AnalysisBucket.Arn}/*"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "AthenaQueryPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Properties": {
+        "PolicyName": "AthenaQueryAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "GetQueryDetails",
+              "Effect": "Allow",
+              "Action": [
+                "athena:GetQueryExecution",
+                "athena:BatchGetQueryExecution"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    },
+    "KMSPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "UseKMSEncryption",
+      "Properties": {
+        "PolicyName": "KMSAccess",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "UseKMSKey",
+              "Effect": "Allow",
+              "Action": [
+                "kms:Encrypt",
+                "kms:Decrypt",
+                "kms:GenerateDataKey"
+              ],
+              "Resource": {
+                "Ref": "KMSKeyArn"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AnalyserFunction": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": [
+        "LambdaLogGroup",
+        "LambdaLogsPolicy"
+      ],
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-analyser"
+        },
+        "Description": "Analyzes Athena usage patterns from CloudTrail events",
+        "Runtime": "python3.14",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "LambdaExecutionRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 300,
+        "MemorySize": 512,
+        "Environment": {
+          "Variables": {
+            "OUTPUT_BUCKET": {
+              "Ref": "AnalysisBucket"
+            },
+            "CLOUDTRAIL_BUCKET": {
+              "Ref": "CloudTrailBucket"
+            },
+            "LOOKBACK_MINUTES": {
+              "Ref": "AnalysisIntervalMinutes"
+            },
+            "LOG_GROUP_NAME": {
+              "Ref": "AnalysisLogGroup"
+            },
+            "ATHENA_WORKGROUPS": {
+              "Ref": "AthenaWorkgroups"
+            },
+            "S3_BUCKETS_TO_MONITOR": {
+              "Ref": "S3BucketsToMonitor"
+            },
+            "STACK_NAME": {
+              "Ref": "AWS::StackName"
+            },
+            "MODE": "LOOKBACK"
+          }
+        },
+        "Code": {
+          "ZipFile": "\"\"\"Athena Usage Analyser Lambda.\"\"\"\n\nimport json\nimport boto3\nimport gzip\nimport io\nimport os\nimport re\nimport hashlib\nfrom datetime import datetime, timedelta, timezone\nfrom collections import defaultdict\nfrom typing import Dict\nimport logging\nimport zipfile\n\n# Configure logging\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\n# AWS clients\ns3_client = boto3.client(\"s3\")\ncloudtrail_client = boto3.client(\"cloudtrail\")\nathena_client = boto3.client(\"athena\")\nlogs_client = boto3.client(\"logs\")\n\n# Configuration from environment variables\nOUTPUT_BUCKET = os.environ.get(\"OUTPUT_BUCKET\", \"\")\nCLOUDTRAIL_BUCKET = os.environ.get(\"CLOUDTRAIL_BUCKET\", \"\")\nLOOKBACK_MINUTES = int(os.environ.get(\"LOOKBACK_MINUTES\", \"10\"))\nLOG_GROUP_NAME = os.environ.get(\"LOG_GROUP_NAME\", \"/athena-usage-analyser/events\")\nATHENA_WORKGROUPS = os.environ.get(\"ATHENA_WORKGROUPS\", \"*\")\nS3_BUCKETS_TO_MONITOR = os.environ.get(\"S3_BUCKETS_TO_MONITOR\", \"*\")\nSTACK_NAME = os.environ.get(\"STACK_NAME\", \"athena-analyser\")\nMODE = os.environ.get(\"MODE\", \"SCHEDULED\")  # 'SCHEDULED' or 'LOOKBACK'\n\n# Lookback mode goes back 90 days (CloudTrail API limit)\nLOOKBACK_MODE_DAYS = 90\n\n# Parse monitored resources\nMONITORED_WORKGROUPS = set(w.strip() for w in ATHENA_WORKGROUPS.split(\",\") if w.strip())\nMONITORED_S3_BUCKETS = set(\n    b.strip() for b in S3_BUCKETS_TO_MONITOR.split(\",\") if b.strip()\n)\n\n# Athena-related CloudTrail event names\nATHENA_EVENTS = [\n    \"StartQueryExecution\",\n    \"StopQueryExecution\",\n    \"GetQueryExecution\",\n    \"GetQueryResults\",\n    \"CreateNamedQuery\",\n    \"DeleteNamedQuery\",\n    \"GetNamedQuery\",\n    \"ListNamedQueries\",\n    \"BatchGetNamedQuery\",\n    \"CreateWorkGroup\",\n    \"DeleteWorkGroup\",\n    \"GetWorkGroup\",\n    \"ListWorkGroups\",\n    \"UpdateWorkGroup\",\n    \"CreateDataCatalog\",\n    \"DeleteDataCatalog\",\n    \"GetDataCatalog\",\n    \"ListDataCatalogs\",\n    \"GetDatabase\",\n    \"ListDatabases\",\n    \"GetTableMetadata\",\n    \"ListTableMetadata\",\n    \"CreatePreparedStatement\",\n    \"DeletePreparedStatement\",\n    \"GetPreparedStatement\",\n    \"ListPreparedStatements\",\n    \"StartSession\",\n    \"TerminateSession\",\n    \"GetSession\",\n    \"ListSessions\",\n    \"StartCalculationExecution\",\n    \"StopCalculationExecution\",\n    \"GetCalculationExecution\",\n    \"ListCalculationExecutions\",\n]\n\nS3_EVENTS = [\"GetObject\", \"PutObject\", \"ListObjects\", \"ListObjectsV2\", \"HeadObject\"]\n\n\ndef log_configuration_summary(run_mode, start_time, end_time):\n    logger.info(\"=\" * 60)\n    logger.info(\"CONFIGURATION\")\n    logger.info(\"=\" * 60)\n    logger.info(f\"Mode: {run_mode}\")\n    logger.info(f\"Time Range: {start_time} to {end_time}\")\n    if \"*\" in MONITORED_WORKGROUPS:\n        logger.info(\"Monitored Workgroups: ALL WORKGROUPS (*)\")\n    else:\n        logger.info(f\"Monitored Workgroups: {', '.join(sorted(MONITORED_WORKGROUPS))}\")\n    if \"*\" in MONITORED_S3_BUCKETS:\n        logger.info(\"Monitored S3 Buckets: AUTO-DETECT\")\n    else:\n        logger.info(f\"Monitored S3 Buckets: {', '.join(sorted(MONITORED_S3_BUCKETS))}\")\n    if CLOUDTRAIL_BUCKET:\n        logger.info(f\"CloudTrail Bucket: {CLOUDTRAIL_BUCKET}\")\n    else:\n        logger.info(\"CloudTrail Bucket: NOT CONFIGURED\")\n    logger.info(\"=\" * 60)\n\n\ndef log_no_athena_events_warning(start_time, end_time, skipped_workgroups):\n    logger.warning(\"!\" * 65)\n    logger.warning(\"WARNING: NO ATHENA EVENTS FOUND\")\n    logger.warning(\"!\" * 65)\n    if \"*\" in MONITORED_WORKGROUPS:\n        logger.warning(\"Monitored Workgroups: ALL WORKGROUPS (*)\")\n    else:\n        logger.warning(\n            f\"Monitored Workgroups: {', '.join(sorted(MONITORED_WORKGROUPS))}\"\n        )\n    logger.warning(f\"Time Range: {start_time} to {end_time}\")\n    if skipped_workgroups:\n        logger.warning(\n            f\"Workgroups seen but filtered out: {', '.join(sorted(skipped_workgroups))}\"\n        )\n    logger.warning(\"\")\n    logger.warning(\"Possible causes:\")\n    logger.warning(\"  - No Athena queries were run during this time period\")\n    logger.warning(\"  - The specified workgroups do not exist in this account\")\n    logger.warning(\"  - CloudTrail is not enabled or not logging Athena events\")\n    logger.warning(\"  - Workgroup names are case-sensitive - verify spelling\")\n    logger.warning(\"\")\n    logger.warning(\"To verify workgroups exist, run:\")\n    logger.warning(\"  aws athena list-work-groups --region <region>\")\n    logger.warning(\"!\" * 65)\n\n\ndef log_no_s3_events_warning(start_time, end_time, skipped_buckets):\n    logger.warning(\"!\" * 65)\n    logger.warning(\"WARNING: NO S3 EVENTS FOUND\")\n    logger.warning(\"!\" * 65)\n    if \"*\" in MONITORED_S3_BUCKETS:\n        logger.warning(\"Monitored S3 Buckets: AUTO-DETECT mode\")\n        logger.warning(\"  (patterns: athena, query-results, datalake, etc.)\")\n    else:\n        logger.warning(\n            f\"Monitored S3 Buckets: {', '.join(sorted(MONITORED_S3_BUCKETS))}\"\n        )\n    logger.warning(f\"Time Range: {start_time} to {end_time}\")\n    if skipped_buckets:\n        logger.warning(\n            f\"Buckets seen but filtered out: {', '.join(sorted(list(skipped_buckets)[:10]))}\"\n        )\n        if len(skipped_buckets) > 10:\n            logger.warning(f\"  ... and {len(skipped_buckets) - 10} more\")\n    logger.warning(\"\")\n    logger.warning(\"Possible causes:\")\n    logger.warning(\"  - No S3 operations occurred during this time period\")\n    logger.warning(\"  - The specified bucket names do not exist\")\n    logger.warning(\"  - CloudTrail data events are not enabled for S3\")\n    logger.warning(\"  - In AUTO-DETECT mode, no buckets matched the expected patterns\")\n    logger.warning(\"!\" * 65)\n\n\ndef log_success_summary(\n    athena_count, s3_count, users, workgroups, export_location, queries_fetched=0\n):\n    logger.info(\"=\" * 60)\n    logger.info(\"SUCCESS: ANALYSIS COMPLETE\")\n    logger.info(\"=\" * 60)\n    logger.info(f\"Athena Events: {athena_count}\")\n    logger.info(f\"Queries Fetched from Athena API: {queries_fetched}\")\n    logger.info(f\"S3 Events: {s3_count}\")\n    logger.info(f\"Unique Users: {users}\")\n    logger.info(f\"Unique Workgroups: {workgroups}\")\n    logger.info(f\"Export Location: {export_location}\")\n    logger.info(\"=\" * 60)\n\n\nclass AthenaUsageAnalyser:\n    def __init__(self):\n        self.athena_events = []\n        self.s3_events = []\n        self.skipped_workgroups = set()\n        self.skipped_buckets = set()\n        self.query_execution_ids = {}\n        self.fetched_queries = {}\n        self.query_patterns = defaultdict(\n            lambda: {\n                \"count\": 0,\n                \"examples\": [],\n                \"users\": set(),\n                \"workgroups\": set(),\n                \"databases\": set(),\n                \"tables\": set(),\n                \"total_data_scanned\": 0,\n                \"total_execution_time_ms\": 0,\n            }\n        )\n        self.workgroup_stats = defaultdict(\n            lambda: {\n                \"query_count\": 0,\n                \"users\": set(),\n                \"total_data_scanned\": 0,\n                \"query_types\": defaultdict(int),\n            }\n        )\n        self.user_stats = defaultdict(\n            lambda: {\n                \"query_count\": 0,\n                \"workgroups\": set(),\n                \"databases\": set(),\n                \"last_activity\": None,\n            }\n        )\n        self.database_stats = defaultdict(\n            lambda: {\n                \"query_count\": 0,\n                \"tables\": set(),\n                \"users\": set(),\n            }\n        )\n        self.s3_bucket_stats = defaultdict(\n            lambda: {\n                \"get_count\": 0,\n                \"put_count\": 0,\n                \"list_count\": 0,\n                \"prefixes\": set(),\n                \"users\": set(),\n            }\n        )\n        self.hourly_query_counts = defaultdict(int)\n        self.errors = []\n        self.start_time = None\n        self.end_time = None\n\n    def should_monitor_workgroup(self, workgroup: str) -> bool:\n        if \"*\" in MONITORED_WORKGROUPS:\n            return True\n        return workgroup in MONITORED_WORKGROUPS\n\n    def should_monitor_bucket(self, bucket: str) -> bool:\n        if \"*\" in MONITORED_S3_BUCKETS:\n            return self._is_athena_related_bucket(bucket, \"\")\n        return bucket in MONITORED_S3_BUCKETS\n\n    def process_cloudtrail_events(self, start_time: datetime, end_time: datetime):\n        self.start_time = start_time\n        self.end_time = end_time\n        logger.info(f\"Processing CloudTrail events from {start_time} to {end_time}\")\n        self._fetch_events_from_api(start_time, end_time)\n        if CLOUDTRAIL_BUCKET:\n            self._fetch_events_from_s3(start_time, end_time)\n        logger.info(\"-\" * 50)\n        logger.info(\"EVENT COLLECTION SUMMARY\")\n        logger.info(\"-\" * 50)\n        logger.info(f\"CloudTrail API: {len(ATHENA_EVENTS)} Athena + {len(S3_EVENTS)} S3 event types\")\n        logger.info(f\"Athena Events Collected: {len(self.athena_events)}\")\n        if self.skipped_workgroups:\n            logger.info(f\"Athena Skipped: {', '.join(sorted(self.skipped_workgroups))}\")\n        logger.info(f\"S3 Events Collected: {len(self.s3_events)}\")\n        if self.skipped_buckets:\n            logger.info(\n                f\"S3 Events Skipped (bucket filter): {len(self.skipped_buckets)} buckets filtered\"\n            )\n        logger.info(\"-\" * 50)\n\n    def _fetch_events_from_api(self, start_time: datetime, end_time: datetime):\n        try:\n            paginator = cloudtrail_client.get_paginator(\"lookup_events\")\n            for event_name in ATHENA_EVENTS:\n                try:\n                    for page in paginator.paginate(\n                        LookupAttributes=[\n                            {\"AttributeKey\": \"EventName\", \"AttributeValue\": event_name}\n                        ],\n                        StartTime=start_time,\n                        EndTime=end_time,\n                        MaxResults=50,\n                    ):\n                        for event in page.get(\"Events\", []):\n                            self._process_event(event)\n                except Exception as e:\n                    logger.warning(f\"Error fetching {event_name}: {str(e)}\")\n            for event_name in S3_EVENTS:\n                try:\n                    for page in paginator.paginate(\n                        LookupAttributes=[\n                            {\"AttributeKey\": \"EventName\", \"AttributeValue\": event_name}\n                        ],\n                        StartTime=start_time,\n                        EndTime=end_time,\n                        MaxResults=50,\n                    ):\n                        for event in page.get(\"Events\", []):\n                            self._process_event(event)\n                except Exception as e:\n                    logger.warning(f\"Error fetching S3 {event_name}: {str(e)}\")\n        except Exception as e:\n            logger.error(f\"CloudTrail API error: {str(e)}\")\n            self.errors.append({\"source\": \"cloudtrail_api\", \"error\": str(e)})\n\n    def _fetch_events_from_s3(self, start_time: datetime, end_time: datetime):\n        try:\n            sts = boto3.client(\"sts\")\n            account_id = sts.get_caller_identity()[\"Account\"]\n            region = boto3.session.Session().region_name\n            current = start_time\n            while current <= end_time:\n                prefix = f\"AWSLogs/{account_id}/CloudTrail/{region}/{current.strftime('%Y/%m/%d')}/\"\n                logger.info(f\"S3 scan: {prefix}\")\n                paginator = s3_client.get_paginator(\"list_objects_v2\")\n                for page in paginator.paginate(Bucket=CLOUDTRAIL_BUCKET, Prefix=prefix):\n                    for obj in page.get(\"Contents\", []):\n                        self._process_cloudtrail_file(obj[\"Key\"])\n                current += timedelta(days=1)\n        except Exception as e:\n            logger.error(f\"CloudTrail S3 error: {str(e)}\")\n            self.errors.append({\"source\": \"cloudtrail_s3\", \"error\": str(e)})\n\n    def _process_cloudtrail_file(self, key: str):\n        try:\n            response = s3_client.get_object(Bucket=CLOUDTRAIL_BUCKET, Key=key)\n            with gzip.GzipFile(fileobj=io.BytesIO(response[\"Body\"].read())) as f:\n                data = json.loads(f.read().decode(\"utf-8\"))\n            for record in data.get(\"Records\", []):\n                self._process_event({\"CloudTrailEvent\": json.dumps(record)})\n        except Exception as e:\n            logger.warning(f\"Error processing {key}: {str(e)}\")\n\n    def _process_event(self, event: Dict):\n        try:\n            if \"CloudTrailEvent\" in event:\n                event_data = json.loads(event[\"CloudTrailEvent\"])\n            else:\n                event_data = event\n            event_name = event_data.get(\"eventName\", \"\")\n            event_source = event_data.get(\"eventSource\", \"\")\n            if event_source == \"athena.amazonaws.com\" or event_name in ATHENA_EVENTS:\n                self._process_athena_event(event_data)\n            elif event_source == \"s3.amazonaws.com\" and event_name in S3_EVENTS:\n                self._process_s3_event(event_data)\n        except Exception as e:\n            logger.warning(f\"Event processing error: {str(e)}\")\n\n    def _process_athena_event(self, event: Dict):\n        event_name = event.get(\"eventName\", \"\")\n        event_time = event.get(\"eventTime\", \"\")\n        user_identity = event.get(\"userIdentity\", {})\n        request_params = event.get(\"requestParameters\", {}) or {}\n        response_elements = event.get(\"responseElements\", {}) or {}\n\n        user_arn = user_identity.get(\"arn\", \"unknown\")\n        user_id = self._extract_user_id(user_arn, user_identity.get(\"principalId\", \"\"))\n        workgroup = request_params.get(\"workGroup\", \"primary\")\n\n        if not self.should_monitor_workgroup(workgroup):\n            self.skipped_workgroups.add(workgroup)\n            return\n\n        processed_event = {\n            \"event_name\": event_name,\n            \"event_time\": event_time,\n            \"user_id\": user_id,\n            \"user_arn\": user_arn,\n            \"aws_region\": event.get(\"awsRegion\", \"\"),\n            \"source_ip\": event.get(\"sourceIPAddress\", \"\"),\n            \"request_parameters\": request_params,\n            \"response_elements\": response_elements,\n            \"error_code\": event.get(\"errorCode\"),\n        }\n        self.athena_events.append(processed_event)\n\n        if event_name == \"StartQueryExecution\":\n            query_execution_id = response_elements.get(\"queryExecutionId\", \"\")\n            if query_execution_id:\n                self.query_execution_ids[query_execution_id] = {\n                    \"event\": processed_event,\n                    \"request_params\": request_params,\n                    \"workgroup\": workgroup,\n                    \"user_id\": user_id,\n                }\n        elif event_name == \"GetQueryExecution\":\n            self._process_query_result(processed_event, response_elements)\n\n        self.user_stats[user_id][\"query_count\"] += 1\n        self.user_stats[user_id][\"last_activity\"] = event_time\n        if event_time:\n            try:\n                self.hourly_query_counts[event_time[:13]] += 1\n            except Exception:\n                pass\n\n    def _process_query_result(self, event: Dict, response_elements: Dict):\n        query_execution = response_elements.get(\"queryExecution\", {})\n        if not query_execution:\n            return\n        statistics = query_execution.get(\"statistics\", {})\n        workgroup = query_execution.get(\"workGroup\", \"primary\")\n        data_scanned = statistics.get(\"dataScannedInBytes\", 0)\n        if data_scanned:\n            self.workgroup_stats[workgroup][\"total_data_scanned\"] += data_scanned\n\n    def _fetch_query_strings(self):\n        if not self.query_execution_ids:\n            logger.info(\"No query execution IDs to fetch\")\n            return\n        logger.info(f\"Fetching {len(self.query_execution_ids)} queries from Athena API\")\n        execution_ids = list(self.query_execution_ids.keys())\n        batch_size = 50\n        for i in range(0, len(execution_ids), batch_size):\n            batch = execution_ids[i : i + batch_size]\n            try:\n                response = athena_client.batch_get_query_execution(\n                    QueryExecutionIds=batch\n                )\n                for qe in response.get(\"QueryExecutions\", []):\n                    qe_id = qe.get(\"QueryExecutionId\", \"\")\n                    query_string = qe.get(\"Query\", \"\")\n                    if qe_id and query_string:\n                        self.fetched_queries[qe_id] = {\n                            \"query\": query_string,\n                            \"workgroup\": qe.get(\"WorkGroup\", \"primary\"),\n                            \"database\": qe.get(\"QueryExecutionContext\", {}).get(\n                                \"Database\", \"default\"\n                            ),\n                            \"status\": qe.get(\"Status\", {}).get(\"State\", \"\"),\n                            \"data_scanned\": qe.get(\"Statistics\", {}).get(\n                                \"DataScannedInBytes\", 0\n                            ),\n                            \"execution_time_ms\": qe.get(\"Statistics\", {}).get(\n                                \"EngineExecutionTimeInMillis\", 0\n                            ),\n                        }\n                for failure in response.get(\"UnprocessedQueryExecutionIds\", []):\n                    logger.warning(\n                        f\"Failed to fetch query {failure.get('QueryExecutionId')}: {failure.get('ErrorMessage')}\"\n                    )\n            except Exception as e:\n                logger.warning(f\"Error fetching batch of queries: {str(e)}\")\n        logger.info(f\"Successfully fetched {len(self.fetched_queries)} query strings\")\n\n    def _process_fetched_queries(self):\n        for qe_id, query_data in self.fetched_queries.items():\n            event_data = self.query_execution_ids.get(qe_id, {})\n            if not event_data:\n                continue\n            query_string = query_data[\"query\"]\n            workgroup = query_data[\"workgroup\"]\n            database = query_data[\"database\"]\n            user_id = event_data.get(\"user_id\", \"unknown\")\n            query_type = self._classify_query(query_string)\n            tables = self._extract_tables_from_query(query_string)\n            pattern_hash = self._create_query_pattern_hash(query_string)\n            pattern = self.query_patterns[pattern_hash]\n            pattern[\"count\"] += 1\n            pattern[\"users\"].add(user_id)\n            pattern[\"workgroups\"].add(workgroup)\n            pattern[\"databases\"].add(database)\n            pattern[\"tables\"].update(tables)\n            pattern[\"total_data_scanned\"] += query_data.get(\"data_scanned\", 0)\n            pattern[\"total_execution_time_ms\"] += query_data.get(\"execution_time_ms\", 0)\n            if len(pattern[\"examples\"]) < 5:\n                sanitized = self._sanitize_query(query_string)\n                if sanitized not in pattern[\"examples\"]:\n                    pattern[\"examples\"].append(sanitized)\n            self.workgroup_stats[workgroup][\"query_count\"] += 1\n            self.workgroup_stats[workgroup][\"users\"].add(user_id)\n            self.workgroup_stats[workgroup][\"query_types\"][query_type] += 1\n            self.workgroup_stats[workgroup][\"total_data_scanned\"] += query_data.get(\n                \"data_scanned\", 0\n            )\n            self.database_stats[database][\"query_count\"] += 1\n            self.database_stats[database][\"tables\"].update(tables)\n            self.database_stats[database][\"users\"].add(user_id)\n            self.user_stats[user_id][\"workgroups\"].add(workgroup)\n            self.user_stats[user_id][\"databases\"].add(database)\n\n    def _process_s3_event(self, event: Dict):\n        request_params = event.get(\"requestParameters\", {}) or {}\n        bucket_name = request_params.get(\"bucketName\", \"\")\n        key = request_params.get(\"key\", \"\")\n        if not self.should_monitor_bucket(bucket_name):\n            if bucket_name:\n                self.skipped_buckets.add(bucket_name)\n            return\n\n        event_name = event.get(\"eventName\", \"\")\n        user_identity = event.get(\"userIdentity\", {})\n        user_id = self._extract_user_id(\n            user_identity.get(\"arn\", \"unknown\"), user_identity.get(\"principalId\", \"\")\n        )\n\n        self.s3_events.append(\n            {\n                \"event_name\": event_name,\n                \"event_time\": event.get(\"eventTime\", \"\"),\n                \"bucket\": bucket_name,\n                \"key\": key,\n                \"user_id\": user_id,\n            }\n        )\n\n        stats = self.s3_bucket_stats[bucket_name]\n        if \"Get\" in event_name:\n            stats[\"get_count\"] += 1\n        elif \"Put\" in event_name:\n            stats[\"put_count\"] += 1\n        elif \"List\" in event_name:\n            stats[\"list_count\"] += 1\n        if key:\n            prefix = \"/\".join(key.split(\"/\")[:2])\n            stats[\"prefixes\"].add(prefix)\n        stats[\"users\"].add(user_id)\n\n    def _is_athena_related_bucket(self, bucket_name: str, key: str) -> bool:\n        patterns = [\n            \"athena\",\n            \"query-results\",\n            \"datalake\",\n            \"data-lake\",\n            \"analytics\",\n            \"warehouse\",\n            \"raw\",\n            \"processed\",\n            \"curated\",\n        ]\n        bucket_lower = bucket_name.lower()\n        return any(p in bucket_lower for p in patterns)\n\n    def _extract_user_id(self, user_arn: str, principal_id: str) -> str:\n        if user_arn and user_arn != \"unknown\":\n            parts = user_arn.split(\"/\")\n            if len(parts) > 1:\n                return parts[-1]\n            parts = user_arn.split(\":\")\n            if len(parts) > 0:\n                return parts[-1]\n        return principal_id if principal_id else \"unknown\"\n\n    def _classify_query(self, query: str) -> str:\n        q = query.strip().upper()\n        if q.startswith(\"SELECT\"):\n            return \"CTAS\" if \" AS SELECT\" in q else \"SELECT\"\n        elif q.startswith(\"CREATE TABLE\"):\n            return \"CREATE_TABLE\"\n        elif q.startswith(\"CREATE VIEW\"):\n            return \"CREATE_VIEW\"\n        elif q.startswith(\"DROP\"):\n            return \"DROP\"\n        elif q.startswith(\"ALTER\"):\n            return \"ALTER\"\n        elif q.startswith(\"INSERT\"):\n            return \"INSERT\"\n        elif q.startswith(\"SHOW\"):\n            return \"SHOW\"\n        elif q.startswith(\"DESCRIBE\"):\n            return \"DESCRIBE\"\n        elif q.startswith(\"MSCK\"):\n            return \"MSCK_REPAIR\"\n        elif q.startswith(\"UNLOAD\"):\n            return \"UNLOAD\"\n        return \"OTHER\"\n\n    def _extract_tables_from_query(self, query: str) -> set:\n        tables = set()\n        patterns = [\n            r\"\\bFROM\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)?)\",\n            r\"\\bJOIN\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)?)\",\n        ]\n        for pattern in patterns:\n            tables.update(re.findall(pattern, query, re.IGNORECASE))\n        keywords = {\"select\", \"from\", \"where\", \"and\", \"or\", \"as\", \"on\"}\n        return {t for t in tables if t.lower() not in keywords}\n\n    def _create_query_pattern_hash(self, query: str) -> str:\n        normalized = query.strip().upper()\n        normalized = re.sub(r\"'[^']*'\", \"'?'\", normalized)\n        normalized = re.sub(r\"\\b\\d+\\.?\\d*\\b\", \"?\", normalized)\n        normalized = \" \".join(normalized.split())\n        return hashlib.md5(normalized.encode()).hexdigest()[:12]\n\n    def _sanitize_query(self, query: str) -> str:\n        sanitized = re.sub(r\"'[^']*'\", \"'<VALUE>'\", query)\n        return sanitized[:1000] + \"...\" if len(sanitized) > 1000 else sanitized\n\n    def generate_summary(self) -> Dict:\n        def convert_sets(obj):\n            if isinstance(obj, set):\n                return list(obj)\n            elif isinstance(obj, dict):\n                return {k: convert_sets(v) for k, v in obj.items()}\n            elif isinstance(obj, list):\n                return [convert_sets(i) for i in obj]\n            return obj\n\n        return {\n            \"analysis_period\": {\n                \"start\": self.start_time.isoformat() if self.start_time else None,\n                \"end\": self.end_time.isoformat() if self.end_time else None,\n            },\n            \"configuration\": {\n                \"monitored_workgroups\": list(MONITORED_WORKGROUPS),\n                \"monitored_s3_buckets\": list(MONITORED_S3_BUCKETS),\n            },\n            \"overview\": {\n                \"total_athena_events\": len(self.athena_events),\n                \"total_s3_events\": len(self.s3_events),\n                \"query_execution_ids_found\": len(self.query_execution_ids),\n                \"queries_fetched_from_athena\": len(self.fetched_queries),\n                \"unique_users\": len(self.user_stats),\n                \"unique_workgroups\": len(self.workgroup_stats),\n                \"unique_databases\": len(self.database_stats),\n                \"unique_query_patterns\": len(self.query_patterns),\n                \"skipped_workgroups\": list(self.skipped_workgroups),\n                \"skipped_buckets_count\": len(self.skipped_buckets),\n            },\n            \"workgroup_stats\": convert_sets(dict(self.workgroup_stats)),\n            \"user_stats\": convert_sets(dict(self.user_stats)),\n            \"database_stats\": convert_sets(dict(self.database_stats)),\n            \"query_patterns\": convert_sets(dict(self.query_patterns)),\n            \"s3_bucket_stats\": convert_sets(dict(self.s3_bucket_stats)),\n            \"hourly_query_counts\": dict(self.hourly_query_counts),\n            \"errors\": self.errors,\n        }\n\n    def write_to_cloudwatch_logs(self):\n        try:\n            timestamp = datetime.now(timezone.utc)\n            stream_name = f\"analysis-{timestamp.strftime('%Y-%m-%d-%H-%M-%S')}\"\n            try:\n                logs_client.create_log_stream(\n                    logGroupName=LOG_GROUP_NAME, logStreamName=stream_name\n                )\n            except Exception:\n                pass\n\n            summary = self.generate_summary()\n            log_events = [\n                {\n                    \"timestamp\": int(timestamp.timestamp() * 1000),\n                    \"message\": json.dumps(\n                        {\"type\": \"SUMMARY\", \"data\": summary[\"overview\"]}\n                    ),\n                }\n            ]\n\n            for wg, stats in self.workgroup_stats.items():\n                log_events.append(\n                    {\n                        \"timestamp\": int(timestamp.timestamp() * 1000),\n                        \"message\": json.dumps(\n                            {\n                                \"type\": \"WORKGROUP\",\n                                \"workgroup\": wg,\n                                \"query_count\": stats[\"query_count\"],\n                                \"unique_users\": len(stats[\"users\"]),\n                            }\n                        ),\n                    }\n                )\n\n            for i in range(0, len(log_events), 100):\n                batch = sorted(log_events[i : i + 100], key=lambda x: x[\"timestamp\"])\n                logs_client.put_log_events(\n                    logGroupName=LOG_GROUP_NAME,\n                    logStreamName=stream_name,\n                    logEvents=batch,\n                )\n            logger.info(f\"Wrote {len(log_events)} log events\")\n        except Exception as e:\n            logger.error(f\"Logs error: {str(e)}\")\n            self.errors.append({\"source\": \"logs\", \"error\": str(e)})\n\n    def export_to_s3(self) -> str:\n        try:\n            timestamp = datetime.now(timezone.utc)\n            zip_key = f\"exports/{timestamp.strftime('%Y/%m/%d')}/athena-usage-{timestamp.strftime('%Y%m%d-%H%M%S')}.zip\"\n\n            zip_buffer = io.BytesIO()\n            with zipfile.ZipFile(zip_buffer, \"w\", zipfile.ZIP_DEFLATED) as zf:\n                summary = self.generate_summary()\n                zf.writestr(\"summary.json\", json.dumps(summary, indent=2, default=str))\n                zf.writestr(\n                    \"athena_events.json\",\n                    json.dumps(self.athena_events, indent=2, default=str),\n                )\n                zf.writestr(\n                    \"s3_events.json\", json.dumps(self.s3_events, indent=2, default=str)\n                )\n\n                lines = [\"ATHENA USAGE REPORT\", \"=\" * 60, \"\"]\n                for wg, stats in self.workgroup_stats.items():\n                    lines.extend(\n                        [\n                            f\"\\nWorkgroup: {wg}\",\n                            f\"  Queries: {stats['query_count']}\",\n                            f\"  Users: {len(stats['users'])}\",\n                            f\"  Data Scanned: {stats['total_data_scanned'] / (1024**3):.2f} GB\",\n                            f\"  Query Types: {dict(stats['query_types'])}\",\n                        ]\n                    )\n                zf.writestr(\"workgroup_report.txt\", \"\\n\".join(lines))\n\n                csv_lines = [\"workgroup,query_count,unique_users,data_scanned_gb\"]\n                for wg, stats in self.workgroup_stats.items():\n                    csv_lines.append(\n                        f\"{wg},{stats['query_count']},{len(stats['users'])},{stats['total_data_scanned'] / (1024**3):.4f}\"\n                    )\n                zf.writestr(\"workgroup_stats.csv\", \"\\n\".join(csv_lines))\n\n            zip_buffer.seek(0)\n            s3_client.put_object(\n                Bucket=OUTPUT_BUCKET,\n                Key=zip_key,\n                Body=zip_buffer.getvalue(),\n                ContentType=\"application/zip\",\n                ServerSideEncryption=\"AES256\",\n            )\n            logger.info(f\"Exported to s3://{OUTPUT_BUCKET}/{zip_key}\")\n            return f\"s3://{OUTPUT_BUCKET}/{zip_key}\"\n        except Exception as e:\n            logger.error(f\"S3 export error: {str(e)}\")\n            self.errors.append({\"source\": \"s3_export\", \"error\": str(e)})\n            return None\n\n\ndef lambda_handler(event, context):\n    logger.info(f\"Lambda invoked: {json.dumps(event)}\")\n\n    run_mode = event.get(\"mode\", MODE).upper()\n\n    if \"start_time\" in event and \"end_time\" in event:\n        start_time = datetime.fromisoformat(event[\"start_time\"].replace(\"Z\", \"+00:00\"))\n        end_time = datetime.fromisoformat(event[\"end_time\"].replace(\"Z\", \"+00:00\"))\n    elif run_mode == \"LOOKBACK\":\n        end_time = datetime.now(timezone.utc)\n        start_time = end_time - timedelta(days=LOOKBACK_MODE_DAYS)\n    else:\n        end_time = datetime.now(timezone.utc)\n        start_time = end_time - timedelta(minutes=LOOKBACK_MINUTES)\n\n    log_configuration_summary(run_mode, start_time, end_time)\n\n    analyser = AthenaUsageAnalyser()\n\n    try:\n        analyser.process_cloudtrail_events(start_time, end_time)\n        analyser._fetch_query_strings()\n        analyser._process_fetched_queries()\n        analyser.write_to_cloudwatch_logs()\n        export_location = analyser.export_to_s3()\n        summary = analyser.generate_summary()\n\n        if len(analyser.athena_events) == 0:\n            log_no_athena_events_warning(\n                start_time, end_time, analyser.skipped_workgroups\n            )\n        if len(analyser.s3_events) == 0:\n            log_no_s3_events_warning(start_time, end_time, analyser.skipped_buckets)\n\n        if len(analyser.athena_events) > 0 or len(analyser.s3_events) > 0:\n            log_success_summary(\n                len(analyser.athena_events),\n                len(analyser.s3_events),\n                len(analyser.user_stats),\n                len(analyser.workgroup_stats),\n                export_location,\n                len(analyser.fetched_queries),\n            )\n\n        return {\n            \"statusCode\": 200,\n            \"body\": {\n                \"message\": \"Analysis completed\",\n                \"mode\": run_mode,\n                \"analysis_period\": {\n                    \"start\": start_time.isoformat(),\n                    \"end\": end_time.isoformat(),\n                },\n                \"overview\": summary[\"overview\"],\n                \"export_location\": export_location,\n                \"errors\": analyser.errors,\n            },\n        }\n    except Exception as e:\n        logger.error(f\"Analysis failed: {str(e)}\")\n        return {\n            \"statusCode\": 500,\n            \"body\": {\"message\": f\"Failed: {str(e)}\", \"errors\": analyser.errors},\n        }\n"
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          }
+        ]
+      }
+    },
+    "ScheduleRule": {
+      "Type": "AWS::Events::Rule",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-schedule"
+        },
+        "Description": "Triggers Athena usage analysis at regular intervals",
+        "ScheduleExpression": {
+          "Fn::Sub": "rate(${AnalysisIntervalMinutes} minutes)"
+        },
+        "State": "DISABLED",
+        "Targets": [
+          {
+            "Id": "AnalyserTarget",
+            "Arn": {
+              "Fn::GetAtt": [
+                "AnalyserFunction",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "SchedulePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "AnalyserFunction"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com",
+        "SourceArn": {
+          "Fn::GetAtt": [
+            "ScheduleRule",
+            "Arn"
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "AnalysisBucketName": {
+      "Description": "S3 bucket containing analysis results",
+      "Value": {
+        "Ref": "AnalysisBucket"
+      },
+      "Export": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-AnalysisBucket"
+        }
+      }
+    },
+    "AnalysisBucketArn": {
+      "Description": "ARN of the analysis S3 bucket",
+      "Value": {
+        "Fn::GetAtt": [
+          "AnalysisBucket",
+          "Arn"
+        ]
+      }
+    },
+    "LambdaFunctionArn": {
+      "Description": "ARN of the analyser Lambda function",
+      "Value": {
+        "Fn::GetAtt": [
+          "AnalyserFunction",
+          "Arn"
+        ]
+      }
+    },
+    "LambdaFunctionName": {
+      "Description": "Name of the analyser Lambda function",
+      "Value": {
+        "Ref": "AnalyserFunction"
+      }
+    },
+    "LogGroupName": {
+      "Description": "CloudWatch Log Group for analysis events",
+      "Value": {
+        "Ref": "AnalysisLogGroup"
+      }
+    },
+    "ExportsLocation": {
+      "Description": "S3 path where zip exports are stored",
+      "Value": {
+        "Fn::Sub": "s3://${AnalysisBucket}/exports/"
+      }
+    },
+    "InstructionsForCustomer": {
+      "Description": "Instructions for retrieving analysis data",
+      "Value": {
+        "Fn::Sub": "To retrieve Athena usage analysis:\n1. Analysis runs every ${AnalysisIntervalMinutes} minutes automatically\n2. Download exports from: s3://${AnalysisBucket}/exports/\n3. View logs in CloudWatch Log Group: /athena-usage-analyser/${AWS::StackName}"
+      }
+    }
+  }
+}

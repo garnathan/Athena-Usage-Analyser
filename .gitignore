@@ -1,0 +1,41 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.venv
+env/
+venv/
+ENV/
+.idea/
+.vscode/
+*.zip
+
+# Generated reports
+athena-usage-report-*.html
+report
+
+# Downloaded exports
+exports/
+
+# OS files
+.DS_Store
+
+# Linter cache
+.ruff_cache/
