@@ -1,0 +1,204 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Athena Usage Analyser - Cross-Account Read-Only Role. Deploy this in each monitored account to allow the collector Lambda to read CloudTrail and Athena data.",
+  "Metadata": {
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {
+            "default": "Collector Account Configuration"
+          },
+          "Parameters": [
+            "CollectorAccountId",
+            "CollectorStackName",
+            "ExternalId"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Optional Configuration"
+          },
+          "Parameters": [
+            "CloudTrailBucket"
+          ]
+        }
+      ],
+      "ParameterLabels": {
+        "CollectorAccountId": {
+          "default": "Collector AWS Account ID"
+        },
+        "CollectorStackName": {
+          "default": "Collector Stack Name"
+        },
+        "ExternalId": {
+          "default": "External ID (shared secret)"
+        },
+        "CloudTrailBucket": {
+          "default": "CloudTrail Logs Bucket (Optional)"
+        }
+      }
+    }
+  },
+  "Parameters": {
+    "CollectorAccountId": {
+      "Type": "String",
+      "Description": "The AWS account ID where the Athena Usage Analyser collector stack is deployed.",
+      "AllowedPattern": "^[0-9]{12}$",
+      "ConstraintDescription": "Must be a 12-digit AWS account ID."
+    },
+    "CollectorStackName": {
+      "Type": "String",
+      "Description": "The CloudFormation stack name of the collector deployment (used to construct the Lambda role ARN).",
+      "Default": "athena-usage-analyser"
+    },
+    "ExternalId": {
+      "Type": "String",
+      "Description": "Shared secret for the AssumeRole trust policy. Must match the value configured in the collector stack.",
+      "MinLength": 1
+    },
+    "CloudTrailBucket": {
+      "Type": "String",
+      "Description": "(Optional) S3 bucket containing CloudTrail logs in this account. Leave empty if not using S3-based CloudTrail analysis.",
+      "Default": ""
+    }
+  },
+  "Conditions": {
+    "HasCloudTrailBucket": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "CloudTrailBucket"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "AthenaUsageAnalyserReadRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": "AthenaUsageAnalyserReadRole",
+        "Description": "Read-only role for the Athena Usage Analyser collector to access CloudTrail and Athena data in this account.",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:aws:iam::${CollectorAccountId}:role/${CollectorStackName}-lambda-role"
+                }
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "sts:ExternalId": {
+                    "Ref": "ExternalId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CloudTrailReadAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "LookupCloudTrailEvents",
+                  "Effect": "Allow",
+                  "Action": [
+                    "cloudtrail:LookupEvents"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName": "AthenaQueryAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "GetQueryDetails",
+                  "Effect": "Allow",
+                  "Action": [
+                    "athena:GetQueryExecution",
+                    "athena:BatchGetQueryExecution"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "AthenaUsageAnalysis"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "CloudFormation"
+          }
+        ]
+      }
+    },
+    "CloudTrailBucketPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "HasCloudTrailBucket",
+      "Properties": {
+        "PolicyName": "CloudTrailBucketReadAccess",
+        "Roles": [
+          {
+            "Ref": "AthenaUsageAnalyserReadRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "ReadCloudTrailLogs",
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:ListBucket"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:aws:s3:::${CloudTrailBucket}"
+                },
+                {
+                  "Fn::Sub": "arn:aws:s3:::${CloudTrailBucket}/AWSLogs/*"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "RoleArn": {
+      "Description": "ARN of the read-only role for the collector Lambda",
+      "Value": {
+        "Fn::GetAtt": [
+          "AthenaUsageAnalyserReadRole",
+          "Arn"
+        ]
+      }
+    },
+    "RoleName": {
+      "Description": "Name of the read-only role",
+      "Value": {
+        "Ref": "AthenaUsageAnalyserReadRole"
+      }
+    }
+  }
+}

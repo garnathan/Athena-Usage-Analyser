@@ -1,122 +1,74 @@
 # Athena Usage Analyser
 
-A CloudFormation-deployed Lambda that captures Amazon Athena usage via CloudTrail events and generates comprehensive usage and migration readiness reports.
+CloudFormation-deployed Lambda that captures Athena usage via CloudTrail and generates usage and migration readiness reports.
+
+## Quick Start
+
+```bash
+python3 deploy.py           # 1. Deploy
+python3 analyse_exports.py  # 2. Analyse
+python3 cleanup.py          # 3. Cleanup (when done)
+```
+
+All three scripts are interactive and guide you through each step. Requires the AWS CLI to be installed and configured.
 
 ## What Gets Captured
 
-### Basic Usage Metrics
-- Query patterns (SQL structures with values sanitized)
-- Query types (SELECT, CTAS, INSERT, DDL, etc.)
-- Workgroup usage and data scanned
-- User activity and timing
-- Database and table access frequency
+- Query patterns, types (SELECT, CTAS, DDL, etc.), and data scanned
+- Workgroup, user, database, and table usage
 - S3 bucket access patterns
+- Migration readiness: query complexity, DDL tracking, long-running queries, concurrency, partition usage, SQL compatibility flags, and a 0-100 readiness score
 
-### Migration Readiness Analysis
-- **Query Complexity**: JOIN counts, CTE usage, subquery depth, potential full table scans
-- **DDL Operations**: CREATE, DROP, ALTER, TRUNCATE tracking by user and time
-- **Long-Running Queries**: Queries exceeding 10, 30, or 60 minute thresholds
-- **Concurrency Patterns**: Peak concurrent queries per minute
-- **Partition Usage**: Queries using vs missing partition filters
-- **SQL Compatibility Flags**: Features requiring attention during migration
-- **Migration Readiness Score**: 0-100 score based on complexity, DDL patterns, and compatibility
+## Analysis Modes
 
----
+### Single Account (default)
 
-## Step 1: Deploy
+Analyses Athena usage in the account where the stack is deployed.
 
-The interactive deploy script handles everything — CloudTrail verification, optional S3 data event setup, and CloudFormation stack deployment:
+### Multi-Account (manual)
 
-```bash
-python3 deploy.py
-```
+Analyses multiple AWS accounts via explicit account IDs and cross-account AssumeRole. The deploy script collects account IDs, generates an ExternalId, and shows commands to deploy a read-only IAM role in each monitored account.
 
-The script will walk you through:
+The cross-account role grants read-only access to `cloudtrail:LookupEvents` and `athena:BatchGetQueryExecution`.
 
-1. **Pre-flight checks** — verifies AWS CLI, credentials, and the CloudFormation template
-2. **Region & CloudTrail** — asks for your AWS region and verifies CloudTrail is active
-3. **S3 Data Events (optional)** — offers to enable S3 data events for bucket-level access monitoring. If enabled, you select a CloudTrail trail and pick S3 buckets from your account
-4. **Configure & Deploy** — collects stack parameters (with sensible defaults), shows a summary, and deploys the CloudFormation stack
+### AWS Organizations
 
-> **Note:** The script requires the AWS CLI to be installed and configured. If credentials are missing or expired, it will prompt you to authenticate and retry.
+The simplest multi-account setup for customers using AWS Organizations:
 
-### Available Parameters
+- **Auto-discovers accounts** via `organizations:ListAccounts`
+- **Reads from Organization Trail** — all CloudTrail data from one S3 bucket
+- **Deploys cross-account roles via StackSets** — one command for all accounts
+- **Cross-account roles are optional** — query strings come from CloudTrail; roles only add execution stats (data scanned, timing)
+
+Requires the collector stack to be in the management account (or delegated admin). An Organization Trail is recommended but optional.
+
+## Parameters
 
 The deploy script asks for these interactively. All have sensible defaults.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `AthenaWorkgroups` | `*` | Workgroups to monitor (comma-separated, or `*` for all) |
-| `S3BucketsToMonitor` | `*` | S3 buckets to track (`*` auto-detects Athena-related buckets) |
-| `CloudTrailBucket` | *(auto-detected)* | **Required for S3 monitoring.** CloudTrail S3 bucket where logs are stored |
-| `AnalysisIntervalMinutes` | `10` | How often to run (5-60 minutes) |
+| `AnalysisMode` | `single` | `single` or `multi` |
+| `MonitoredAccountIds` | *(empty)* | Comma-separated AWS account IDs (manual multi-account) |
+| `CrossAccountExternalId` | *(auto-generated)* | Shared secret for AssumeRole trust |
+| `MultiAccountMethod` | `manual` | `manual` or `org` (AWS Organizations) |
+| `OrganizationId` | *(auto-detected)* | AWS Organization ID (org mode) |
+| `OrgTrailBucket` | *(auto-detected)* | Organization Trail S3 bucket (org mode) |
+| `AthenaWorkgroups` | `*` | Workgroups to monitor |
+| `S3BucketsToMonitor` | `*` | S3 buckets to track |
+| `CloudTrailBucket` | *(auto-detected)* | CloudTrail S3 bucket |
+| `AnalysisIntervalMinutes` | `60` | How often to run (default: hourly) |
 | `RetentionDays` | `90` | Data retention period (7-365 days) |
-| `KMSKeyArn` | *(empty)* | KMS key for encryption (uses AES-256 if not specified) |
+| `KMSKeyArn` | *(empty)* | KMS key for encryption (AES-256 if not set) |
 
-The last three are available under "Customize advanced settings" during deployment.
+## Output
 
----
+Each analysis run exports a zip to S3: `summary.json`, `athena_events.json`, `s3_events.json`, `workgroup_report.txt`, `workgroup_stats.csv`, and `per_account_summary.json` (multi-account only).
 
-## Step 2: Analyse
-
-The analysis script handles Lambda invocation, export download, and report generation:
-
-```bash
-python3 analyse_exports.py
-```
-
-Running with no arguments starts **interactive mode**, which walks you through:
-
-1. **Find deployed stack** — auto-discovers the CloudFormation stack and reads its outputs (Lambda function name, S3 bucket)
-2. **Run analysis (optional)** — invoke the Lambda for historical data with a selectable time range (7/30/60/90 days or custom)
-3. **Download & generate report** — syncs exports from S3 and generates an HTML report that opens in your browser
-
-You can also run in **direct mode** by passing a local exports path:
-
-```bash
-python3 analyse_exports.py ./exports/                        # HTML report, auto-opens
-python3 analyse_exports.py ./exports/ --output report.txt    # Text report instead
-python3 analyse_exports.py ./exports/ --no-open              # HTML report, no auto-open
-```
-
-> **Note:** The Lambda also runs automatically every `AnalysisIntervalMinutes` (default: 10 minutes). You can skip the Lambda invocation step if you only want to download and report on existing data.
-
----
-
-## Step 3: Cleanup
-
-The interactive cleanup script removes all deployed resources:
-
-```bash
-python3 cleanup.py
-```
-
-The script will walk you through:
-
-1. **Find deployed stack** — auto-discovers the CloudFormation stack
-2. **Cleanup** — with a confirmation prompt, then:
-   - Empties the S3 analysis bucket
-   - Deletes the CloudFormation stack and waits for completion
-   - Optionally deletes the retained S3 bucket (has a Retain policy)
-   - Optionally deletes local exports and generated reports
-
----
-
-## Output Files
-
-Each analysis run exports a zip to S3 containing:
-
-| File | Contents |
-|------|----------|
-| `summary.json` | Complete analysis summary |
-| `athena_events.json` | Raw Athena CloudTrail events |
-| `s3_events.json` | Raw S3 CloudTrail events |
-| `workgroup_report.txt` | Human-readable workgroup summary |
-| `workgroup_stats.csv` | Workgroup statistics |
+The analysis script downloads these and generates an HTML report that opens in your browser. In multi-account mode, the report includes a per-account breakdown.
 
 ## Security
 
-- All public access blocked on S3 bucket
-- SSL/TLS enforced for all S3 operations
-- Server-side encryption (AES-256 or customer KMS key)
-- IAM policies follow least-privilege principle
+- All public access blocked on S3, SSL/TLS enforced, server-side encryption (AES-256 or KMS)
+- IAM policies follow least-privilege
+- Cross-account roles are read-only with ExternalId trust validation

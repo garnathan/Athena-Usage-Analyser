@@ -14,39 +14,11 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-# Auto-install rich if needed (same pattern as analyse_exports.py)
-REQUIRED_PACKAGES = ["rich"]
+from _helpers import install_dependencies, run_aws, get_default_region
 
-
-def install_dependencies():
-    """Install required packages if not already installed."""
-    for package in REQUIRED_PACKAGES:
-        try:
-            __import__(package)
-        except ImportError:
-            print(f"Installing required package: {package}...")
-            try:
-                subprocess.check_call(
-                    ["pip3", "install", "--user", package],
-                    stdout=subprocess.DEVNULL,
-                )
-                print(f"  {package} installed successfully.")
-            except subprocess.CalledProcessError:
-                try:
-                    subprocess.check_call(
-                        ["pip3", "install", "--break-system-packages", package],
-                        stdout=subprocess.DEVNULL,
-                    )
-                    print(f"  {package} installed successfully.")
-                except subprocess.CalledProcessError as e:
-                    print(f"  Failed to install {package}: {e}")
-                    print(f"  Please run: pip3 install {package}")
-                    sys.exit(1)
-
-
-install_dependencies()
+install_dependencies(["rich"])
 
 from rich import box
 from rich.console import Console
@@ -62,30 +34,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def run_aws(args: List[str], region: Optional[str] = None) -> Tuple[bool, str]:
-    """Run an AWS CLI command. Returns (success, stdout_or_stderr)."""
-    cmd = ["aws"] + args
-    if region:
-        cmd += ["--region", region]
-    cmd += ["--output", "json", "--no-cli-pager"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    return False, result.stderr.strip()
-
-
-def get_default_region() -> Optional[str]:
-    """Get the default region from AWS CLI config."""
-    result = subprocess.run(
-        ["aws", "configure", "get", "region"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-    return None
 
 
 def get_stack_outputs(stack_name: str, region: str) -> Optional[Dict[str, str]]:
@@ -116,9 +64,7 @@ def preflight_checks() -> Dict:
 
     # 1. AWS CLI
     with console.status("Checking AWS CLI..."):
-        result = subprocess.run(
-            ["aws", "--version"], capture_output=True, text=True
-        )
+        result = subprocess.run(["aws", "--version"], capture_output=True, text=True)
     if result.returncode != 0:
         console.print(
             Panel(
@@ -219,9 +165,7 @@ def step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str, 
         return region, stack_name, outputs
 
     stacks = json.loads(output).get("StackSummaries", [])
-    analyser_stacks = [
-        s for s in stacks if "athena" in s.get("StackName", "").lower()
-    ]
+    analyser_stacks = [s for s in stacks if "athena" in s.get("StackName", "").lower()]
 
     if not analyser_stacks:
         console.print("  [yellow]![/yellow] No Athena-related stacks found.")
@@ -256,7 +200,9 @@ def step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str, 
                     break
             except ValueError:
                 pass
-            console.print(f"  [red]✗[/red] Enter a number between 1 and {len(analyser_stacks)}.")
+            console.print(
+                f"  [red]✗[/red] Enter a number between 1 and {len(analyser_stacks)}."
+            )
 
     outputs = get_stack_outputs(stack_name, region)
     if not outputs:
@@ -293,6 +239,23 @@ def _show_stack_info(outputs: Dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def get_stack_parameters(stack_name: str, region: str) -> Dict[str, str]:
+    """Get CloudFormation stack parameters as a dict."""
+    ok, output = run_aws(
+        ["cloudformation", "describe-stacks", "--stack-name", stack_name],
+        region=region,
+    )
+    if not ok:
+        return {}
+    try:
+        stack = json.loads(output).get("Stacks", [{}])[0]
+        return {
+            p["ParameterKey"]: p["ParameterValue"] for p in stack.get("Parameters", [])
+        }
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return {}
+
+
 def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
     """Empty bucket, delete stack, optionally remove retained bucket and local exports."""
     console.print()
@@ -301,11 +264,21 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
 
     bucket_name = outputs.get("AnalysisBucketName", "")
 
+    # Check if this was a multi-account deployment
+    params = get_stack_parameters(stack_name, region)
+    is_multi_account = params.get("AnalysisMode") == "multi"
+    multi_account_method = params.get("MultiAccountMethod", "manual")
+    monitored_accounts = [
+        a.strip() for a in params.get("MonitoredAccountIds", "").split(",") if a.strip()
+    ]
+
     # Summary of what will be deleted
     console.print("  This will:")
-    console.print(f"    • Empty S3 bucket [cyan]{bucket_name}[/cyan]") if bucket_name else None
+    console.print(
+        f"    • Empty S3 bucket [cyan]{bucket_name}[/cyan]"
+    ) if bucket_name else None
     console.print(f"    • Delete CloudFormation stack [cyan]{stack_name}[/cyan]")
-    console.print(f"    • Optionally remove the retained S3 bucket")
+    console.print("    • Optionally remove the retained S3 bucket")
     console.print()
 
     console.print(
@@ -332,7 +305,7 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
             )
 
         if ok:
-            console.print(f"  [green]✓[/green] S3 bucket emptied")
+            console.print("  [green]✓[/green] S3 bucket emptied")
         else:
             console.print(f"  [yellow]![/yellow] Could not empty bucket: {output}")
 
@@ -354,7 +327,7 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
         )
         sys.exit(1)
 
-    console.print(f"  [green]✓[/green] Stack deletion initiated")
+    console.print("  [green]✓[/green] Stack deletion initiated")
 
     # Wait for deletion
     with console.status("  Waiting for stack deletion to complete..."):
@@ -370,9 +343,11 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
         )
 
     if wait_ok:
-        console.print(f"  [green]✓[/green] Stack deleted")
+        console.print("  [green]✓[/green] Stack deleted")
     else:
-        console.print(f"  [yellow]![/yellow] Stack deletion may still be in progress: {wait_output}")
+        console.print(
+            f"  [yellow]![/yellow] Stack deletion may still be in progress: {wait_output}"
+        )
 
     # 3. Optionally delete retained S3 bucket
     if bucket_name:
@@ -387,10 +362,12 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
                     region=region,
                 )
             if ok:
-                console.print(f"  [green]✓[/green] S3 bucket deleted")
+                console.print("  [green]✓[/green] S3 bucket deleted")
             else:
                 console.print(f"  [yellow]![/yellow] Could not delete bucket: {output}")
-                console.print(f"  [dim]You can delete it manually: aws s3 rb s3://{bucket_name}[/dim]")
+                console.print(
+                    f"  [dim]You can delete it manually: aws s3 rb s3://{bucket_name}[/dim]"
+                )
 
     # 4. Optionally clean up local exports
     exports_dir = SCRIPT_DIR / "exports"
@@ -402,7 +379,9 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
         console.print("  Local files found:")
         if exports_dir.exists():
             zip_count = len(list(exports_dir.glob("*.zip")))
-            console.print(f"    • {exports_dir} ({zip_count} export{'s' if zip_count != 1 else ''})")
+            console.print(
+                f"    • {exports_dir} ({zip_count} export{'s' if zip_count != 1 else ''})"
+            )
         if report_file.exists():
             console.print(f"    • {report_file}")
 
@@ -413,6 +392,68 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
             if report_file.exists():
                 report_file.unlink()
                 console.print(f"  [green]✓[/green] Deleted {report_file}")
+
+    # Cross-account role cleanup guidance
+    if is_multi_account:
+        console.print()
+        if multi_account_method == "org":
+            console.print(
+                Panel(
+                    "[yellow]Cross-account roles may have been deployed via StackSets.[/yellow]\n\n"
+                    "To clean up the StackSet and all instances:\n\n"
+                    "  aws cloudformation delete-stack-instances \\\n"
+                    "    --stack-set-name AthenaUsageAnalyserRole \\\n"
+                    "    --deployment-targets OrganizationalUnitIds=<root-ou-id> \\\n"
+                    "    --regions <region> --no-retain-stacks\n\n"
+                    "  # Wait for instances to be deleted, then:\n"
+                    "  aws cloudformation delete-stack-set \\\n"
+                    "    --stack-set-name AthenaUsageAnalyserRole\n\n"
+                    "To find your root OU ID:\n"
+                    "  aws organizations list-roots --query 'Roots[0].Id'",
+                    title="StackSets Cleanup",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+            )
+        elif monitored_accounts:
+            console.print(
+                Panel(
+                    "[yellow]Cross-account roles were deployed in monitored accounts.[/yellow]\n\n"
+                    "These must be deleted separately in each monitored account:\n\n"
+                    + "\n".join(
+                        f"  aws cloudformation delete-stack "
+                        f"--stack-name AthenaUsageAnalyserRole "
+                        f"  # Account: {acct}"
+                        for acct in monitored_accounts
+                    )
+                    + "\n\nRun the above command while authenticated to each account.",
+                    title="Cross-Account Cleanup",
+                    border_style="yellow",
+                    padding=(1, 2),
+                )
+            )
+
+    # Lambda code bucket cleanup
+    lambda_code_bucket = params.get("LambdaCodeBucket", "")
+    if lambda_code_bucket and lambda_code_bucket != bucket_name:
+        console.print()
+        console.print(
+            f"  [dim]Lambda code bucket [cyan]{lambda_code_bucket}[/cyan] may also need cleanup.[/dim]"
+        )
+        if Confirm.ask("  Delete the Lambda code bucket?", default=False):
+            with console.status(f"  Emptying and deleting {lambda_code_bucket}..."):
+                run_aws(
+                    ["s3", "rm", f"s3://{lambda_code_bucket}", "--recursive"],
+                    region=region,
+                )
+                ok, output = run_aws(
+                    ["s3", "rb", f"s3://{lambda_code_bucket}"],
+                    region=region,
+                )
+            if ok:
+                console.print("  [green]✓[/green] Lambda code bucket deleted")
+            else:
+                console.print(f"  [yellow]![/yellow] Could not delete bucket: {output}")
 
     # Success panel
     console.print()

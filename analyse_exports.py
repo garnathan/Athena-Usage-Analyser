@@ -2,68 +2,31 @@
 """
 Athena Usage Analyser
 
-Analyzes exported zip files from the Athena Usage Analyser Lambda to produce
-meaningful insights and visualizations about customer Athena and S3 usage.
-
-Modes:
-    Interactive (no args):  Finds the deployed stack, optionally invokes Lambda,
-                            downloads exports from S3, and generates the report.
-    Direct (with path):     Analyses a local exports folder or zip file directly.
+Finds the deployed stack, optionally invokes the Lambda for historical data,
+downloads exports from S3, and generates an HTML report.
 
 Usage:
-    python3 analyse_exports.py                                       # Interactive mode
-    python3 analyse_exports.py /path/to/exports/folder               # HTML report, auto-opens
-    python3 analyse_exports.py /path/to/exports/folder --no-open     # HTML report, no auto-open
-    python3 analyse_exports.py /path/to/exports/folder --output report.txt  # Text report instead
+    python3 analyse_exports.py
 """
 
-import argparse
+import base64
+import io
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
-import zipfile
-import subprocess
 import webbrowser
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-import io
 
-# Required packages for full functionality
-REQUIRED_PACKAGES = ["matplotlib", "rich"]
+from _helpers import install_dependencies, run_aws, get_default_region
 
-
-def install_dependencies():
-    """Install required packages if not already installed."""
-    for package in REQUIRED_PACKAGES:
-        try:
-            __import__(package)
-        except ImportError:
-            print(f"Installing required package: {package}...")
-            try:
-                subprocess.check_call(
-                    ["pip3", "install", "--user", package],
-                    stdout=subprocess.DEVNULL,
-                )
-                print(f"  {package} installed successfully.")
-            except subprocess.CalledProcessError:
-                # Try with --break-system-packages as fallback
-                try:
-                    subprocess.check_call(
-                        ["pip3", "install", "--break-system-packages", package],
-                        stdout=subprocess.DEVNULL,
-                    )
-                    print(f"  {package} installed successfully.")
-                except subprocess.CalledProcessError as e:
-                    print(f"  Failed to install {package}: {e}")
-                    print(f"  Please run: pip3 install {package}")
-                    sys.exit(1)
-
-
-# Install dependencies before importing them
-install_dependencies()
+install_dependencies(["matplotlib", "rich"])
 
 import matplotlib
 
@@ -89,6 +52,9 @@ class AthenaExportAnalyser:
         self.all_summaries: List[Dict] = []
         self.all_athena_events: List[Dict] = []
         self.all_s3_events: List[Dict] = []
+        self.per_account_summaries: List[Dict] = []
+        self.analysis_mode: str = "single"
+        self.multi_account_method: str = "manual"
 
         # Aggregated statistics
         self.workgroup_stats: Dict[str, Dict] = defaultdict(
@@ -169,16 +135,24 @@ class AthenaExportAnalyser:
                 "query_text": "",
             }
         )
-        self.join_type_counts: Dict[str, int] = defaultdict(int)  # LEFT, RIGHT, INNER, OUTER, CROSS
-        self.high_complexity_queries: List[Dict] = []  # Queries with 3+ JOINs or deep nesting
+        self.join_type_counts: Dict[str, int] = defaultdict(
+            int
+        )  # LEFT, RIGHT, INNER, OUTER, CROSS
+        self.high_complexity_queries: List[
+            Dict
+        ] = []  # Queries with 3+ JOINs or deep nesting
         self.cte_usage_count: int = 0
         self.queries_with_multiple_joins: int = 0
 
         # DDL Operation Tracking
         self.ddl_operations: List[Dict] = []  # All DDL operations with timestamps
-        self.ddl_by_type: Dict[str, int] = defaultdict(int)  # CREATE, DROP, ALTER, TRUNCATE
+        self.ddl_by_type: Dict[str, int] = defaultdict(
+            int
+        )  # CREATE, DROP, ALTER, TRUNCATE
         self.ddl_by_hour: Dict[int, int] = defaultdict(int)  # Hour of day (0-23)
-        self.ddl_by_user: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.ddl_by_user: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
         self.tables_with_frequent_ddl: Dict[str, int] = defaultdict(int)
 
         # Data Scan Analysis
@@ -201,7 +175,9 @@ class AthenaExportAnalyser:
         # Concurrency Patterns
         self.concurrent_queries_by_minute: Dict[str, int] = defaultdict(int)
         self.peak_concurrency: int = 0
-        self.queries_by_minute: Dict[str, List[str]] = defaultdict(list)  # minute -> list of query IDs
+        self.queries_by_minute: Dict[str, List[str]] = defaultdict(
+            list
+        )  # minute -> list of query IDs
 
         # Long-running Query Tracking
         self.long_running_queries: List[Dict] = []  # Queries > 10 minutes
@@ -209,7 +185,9 @@ class AthenaExportAnalyser:
         self.queries_over_1hr: int = 0
 
         # SQL Compatibility Flags for Migration
-        self.migration_flags: Dict[str, List[Dict]] = defaultdict(list)  # flag -> list of examples
+        self.migration_flags: Dict[str, List[Dict]] = defaultdict(
+            list
+        )  # flag -> list of examples
 
         # Migration Readiness Score Components
         self.readiness_factors: Dict[str, Dict] = {}
@@ -247,6 +225,24 @@ class AthenaExportAnalyser:
                     summary = json.loads(f.read().decode("utf-8"))
                     self.all_summaries.append(summary)
                     self._merge_summary(summary)
+
+                    # Detect multi-account data
+                    config = summary.get("configuration", {})
+                    if config.get("analysis_mode") == "multi":
+                        self.analysis_mode = "multi"
+                        self.multi_account_method = config.get(
+                            "multi_account_method", "manual"
+                        )
+                    if "per_account" in summary:
+                        self.per_account_summaries.extend(summary["per_account"])
+
+            # Load per_account_summary.json (also in zip)
+            if "per_account_summary.json" in zf.namelist():
+                with zf.open("per_account_summary.json") as f:
+                    per_acct = json.loads(f.read().decode("utf-8"))
+                    # Only extend if not already loaded from summary.json
+                    if not self.per_account_summaries:
+                        self.per_account_summaries.extend(per_acct)
 
             # Load athena_events.json
             if "athena_events.json" in zf.namelist():
@@ -314,7 +310,9 @@ class AthenaExportAnalyser:
                 for feature in features:
                     self.sql_features[feature] += 1
                     if len(self.sql_feature_examples[feature]) < 2:
-                        truncated = example[:300] + ("..." if len(example) > 300 else "")
+                        truncated = example[:300] + (
+                            "..." if len(example) > 300 else ""
+                        )
                         self.sql_feature_examples[feature].append(truncated)
 
                 # === MIGRATION RISK ANALYSIS on actual query text ===
@@ -329,17 +327,21 @@ class AthenaExportAnalyser:
 
                 # Track long-running queries (use average execution time for this pattern)
                 if avg_exec_time > 0:
-                    self._track_long_running_query(example, int(avg_exec_time), pattern_user, "")
+                    self._track_long_running_query(
+                        example, int(avg_exec_time), pattern_user, ""
+                    )
 
                 # Detect migration compatibility flags
                 flags = self._detect_migration_compatibility_flags(example)
                 for flag in flags:
                     if len(self.migration_flags[flag]) < 5:
-                        self.migration_flags[flag].append({
-                            "query_id": pattern_hash,
-                            "user": pattern_user,
-                            "query_preview": example[:300],
-                        })
+                        self.migration_flags[flag].append(
+                            {
+                                "query_id": pattern_hash,
+                                "user": pattern_user,
+                                "query_preview": example[:300],
+                            }
+                        )
 
             for user in pattern.get("users", []):
                 self.query_patterns[pattern_hash]["users"].add(user)
@@ -364,6 +366,7 @@ class AthenaExportAnalyser:
         """Process individual Athena events for detailed analysis."""
         for event in events:
             event_time_str = event.get("event_time", "")
+            event_time = None
             if event_time_str:
                 try:
                     event_time = datetime.fromisoformat(
@@ -375,8 +378,7 @@ class AthenaExportAnalyser:
                         self.latest_event = event_time
 
                     # Track daily counts
-                    day_key = event_time.strftime("%Y-%m-%d")
-                    self.daily_counts[day_key] += 1
+                    self.daily_counts[event_time.strftime("%Y-%m-%d")] += 1
                 except ValueError:
                     pass  # Skip events with invalid timestamp format
 
@@ -421,7 +423,9 @@ class AthenaExportAnalyser:
                         self.sql_feature_examples[feature].append(example)
 
                 # === MIGRATION RISK ANALYSIS ===
-                query_id = event.get("query_execution_id", "") or event.get("query_id", "")
+                query_id = event.get("query_execution_id", "") or event.get(
+                    "query_id", ""
+                )
 
                 # Analyze query complexity
                 self._analyze_query_complexity(query_string, query_id)
@@ -434,38 +438,47 @@ class AthenaExportAnalyser:
 
                 # Track long-running queries
                 if execution_time_ms and execution_time_ms > 0:
-                    self._track_long_running_query(query_string, execution_time_ms, user_id, event_time_str)
+                    self._track_long_running_query(
+                        query_string, execution_time_ms, user_id, event_time_str
+                    )
 
                 # Detect migration compatibility flags
                 flags = self._detect_migration_compatibility_flags(query_string)
                 for flag in flags:
                     if len(self.migration_flags[flag]) < 5:
-                        self.migration_flags[flag].append({
-                            "query_id": query_id,
-                            "user": user_id,
-                            "query_preview": query_string[:300],
-                        })
+                        self.migration_flags[flag].append(
+                            {
+                                "query_id": query_id,
+                                "user": user_id,
+                                "query_preview": query_string[:300],
+                            }
+                        )
 
                 # Track data scanned
-                data_scanned = event.get("data_scanned_bytes", 0) or event.get("data_scanned_in_bytes", 0)
+                data_scanned = event.get("data_scanned_bytes", 0) or event.get(
+                    "data_scanned_in_bytes", 0
+                )
                 if data_scanned and data_scanned > 0:
                     self.data_scanned_per_query.append(data_scanned)
                     self.data_scanned_by_user[user_id] += data_scanned
                     # Get workgroup for this query
-                    workgroup = event.get("workgroup", "") or event.get("work_group", "")
+                    workgroup = event.get("workgroup", "") or event.get(
+                        "work_group", ""
+                    )
                     if workgroup:
                         self.data_scanned_by_workgroup[workgroup] += data_scanned
 
-            # Track concurrency by minute
-            if event_time_str:
-                try:
-                    et = datetime.fromisoformat(event_time_str.replace("Z", "+00:00"))
-                    minute_key = et.strftime("%Y-%m-%d %H:%M")
-                    self.concurrent_queries_by_minute[minute_key] += 1
-                    if self.concurrent_queries_by_minute[minute_key] > self.peak_concurrency:
-                        self.peak_concurrency = self.concurrent_queries_by_minute[minute_key]
-                except ValueError:
-                    pass
+            # Track concurrency by minute (reuse parsed event_time)
+            if event_time is not None:
+                minute_key = event_time.strftime("%Y-%m-%d %H:%M")
+                self.concurrent_queries_by_minute[minute_key] += 1
+                if (
+                    self.concurrent_queries_by_minute[minute_key]
+                    > self.peak_concurrency
+                ):
+                    self.peak_concurrency = self.concurrent_queries_by_minute[
+                        minute_key
+                    ]
 
     def _process_s3_events(self, events: List[Dict]) -> None:
         """Process individual S3 events."""
@@ -536,27 +549,25 @@ class AthenaExportAnalyser:
 
     def _detect_sql_features(self, query: str) -> List[str]:
         """Detect SQL dialect features in a query string."""
-        import re
-
         features = []
         query_upper = query.upper()
 
         # CTEs (Common Table Expressions)
-        if re.search(r'\bWITH\s+\w+\s+AS\s*\(', query_upper):
+        if re.search(r"\bWITH\s+\w+\s+AS\s*\(", query_upper):
             features.append("CTE")
 
         # Window Functions
         window_funcs = [
-            r'\bROW_NUMBER\s*\(',
-            r'\bRANK\s*\(',
-            r'\bDENSE_RANK\s*\(',
-            r'\bNTILE\s*\(',
-            r'\bLEAD\s*\(',
-            r'\bLAG\s*\(',
-            r'\bFIRST_VALUE\s*\(',
-            r'\bLAST_VALUE\s*\(',
-            r'\bNTH_VALUE\s*\(',
-            r'\bOVER\s*\(',
+            r"\bROW_NUMBER\s*\(",
+            r"\bRANK\s*\(",
+            r"\bDENSE_RANK\s*\(",
+            r"\bNTILE\s*\(",
+            r"\bLEAD\s*\(",
+            r"\bLAG\s*\(",
+            r"\bFIRST_VALUE\s*\(",
+            r"\bLAST_VALUE\s*\(",
+            r"\bNTH_VALUE\s*\(",
+            r"\bOVER\s*\(",
         ]
         for pattern in window_funcs:
             if re.search(pattern, query_upper):
@@ -564,22 +575,22 @@ class AthenaExportAnalyser:
                 break
 
         # UNNEST
-        if re.search(r'\bUNNEST\s*\(', query_upper):
+        if re.search(r"\bUNNEST\s*\(", query_upper):
             features.append("UNNEST")
 
         # Lambda expressions (arrow notation and functional patterns)
-        if re.search(r'->', query):
+        if re.search(r"->", query):
             features.append("Lambda Expressions")
 
         # Array/Map transformation functions (often use lambdas)
         array_funcs = [
-            r'\bTRANSFORM\s*\(',
-            r'\bFILTER\s*\(',
-            r'\bREDUCE\s*\(',
-            r'\bZIP_WITH\s*\(',
-            r'\bMAP_FILTER\s*\(',
-            r'\bMAP_TRANSFORM_KEYS\s*\(',
-            r'\bMAP_TRANSFORM_VALUES\s*\(',
+            r"\bTRANSFORM\s*\(",
+            r"\bFILTER\s*\(",
+            r"\bREDUCE\s*\(",
+            r"\bZIP_WITH\s*\(",
+            r"\bMAP_FILTER\s*\(",
+            r"\bMAP_TRANSFORM_KEYS\s*\(",
+            r"\bMAP_TRANSFORM_VALUES\s*\(",
         ]
         for pattern in array_funcs:
             if re.search(pattern, query_upper):
@@ -588,61 +599,61 @@ class AthenaExportAnalyser:
 
         # Trino/Presto-specific functions
         trino_funcs = [
-            (r'\bTRY\s*\(', "TRY()"),
-            (r'\bTRY_CAST\s*\(', "TRY_CAST()"),
-            (r'\bAPPROX_DISTINCT\s*\(', "APPROX_DISTINCT()"),
-            (r'\bAPPROX_PERCENTILE\s*\(', "APPROX_PERCENTILE()"),
-            (r'\bMAP_AGG\s*\(', "MAP_AGG()"),
-            (r'\bARRAY_AGG\s*\(', "ARRAY_AGG()"),
-            (r'\bMULTIMAP_AGG\s*\(', "MULTIMAP_AGG()"),
-            (r'\bHISTOGRAM\s*\(', "HISTOGRAM()"),
-            (r'\bSEQUENCE\s*\(', "SEQUENCE()"),
-            (r'\bREPEAT\s*\(', "REPEAT()"),
-            (r'\bFROM_UNIXTIME\s*\(', "FROM_UNIXTIME()"),
-            (r'\bTO_UNIXTIME\s*\(', "TO_UNIXTIME()"),
-            (r'\bDATE_TRUNC\s*\(', "DATE_TRUNC()"),
-            (r'\bDATE_ADD\s*\(', "DATE_ADD()"),
-            (r'\bDATE_DIFF\s*\(', "DATE_DIFF()"),
-            (r'\bJSON_EXTRACT\s*\(', "JSON_EXTRACT()"),
-            (r'\bJSON_EXTRACT_SCALAR\s*\(', "JSON_EXTRACT_SCALAR()"),
-            (r'\bCAST\s*\([^)]+\s+AS\s+ROW\s*\(', "ROW Type Cast"),
-            (r'\bCAST\s*\([^)]+\s+AS\s+ARRAY\s*\(', "ARRAY Type Cast"),
-            (r'\bCAST\s*\([^)]+\s+AS\s+MAP\s*\(', "MAP Type Cast"),
+            (r"\bTRY\s*\(", "TRY()"),
+            (r"\bTRY_CAST\s*\(", "TRY_CAST()"),
+            (r"\bAPPROX_DISTINCT\s*\(", "APPROX_DISTINCT()"),
+            (r"\bAPPROX_PERCENTILE\s*\(", "APPROX_PERCENTILE()"),
+            (r"\bMAP_AGG\s*\(", "MAP_AGG()"),
+            (r"\bARRAY_AGG\s*\(", "ARRAY_AGG()"),
+            (r"\bMULTIMAP_AGG\s*\(", "MULTIMAP_AGG()"),
+            (r"\bHISTOGRAM\s*\(", "HISTOGRAM()"),
+            (r"\bSEQUENCE\s*\(", "SEQUENCE()"),
+            (r"\bREPEAT\s*\(", "REPEAT()"),
+            (r"\bFROM_UNIXTIME\s*\(", "FROM_UNIXTIME()"),
+            (r"\bTO_UNIXTIME\s*\(", "TO_UNIXTIME()"),
+            (r"\bDATE_TRUNC\s*\(", "DATE_TRUNC()"),
+            (r"\bDATE_ADD\s*\(", "DATE_ADD()"),
+            (r"\bDATE_DIFF\s*\(", "DATE_DIFF()"),
+            (r"\bJSON_EXTRACT\s*\(", "JSON_EXTRACT()"),
+            (r"\bJSON_EXTRACT_SCALAR\s*\(", "JSON_EXTRACT_SCALAR()"),
+            (r"\bCAST\s*\([^)]+\s+AS\s+ROW\s*\(", "ROW Type Cast"),
+            (r"\bCAST\s*\([^)]+\s+AS\s+ARRAY\s*\(", "ARRAY Type Cast"),
+            (r"\bCAST\s*\([^)]+\s+AS\s+MAP\s*\(", "MAP Type Cast"),
         ]
         for pattern, name in trino_funcs:
             if re.search(pattern, query_upper):
                 features.append(f"Trino: {name}")
 
         # Complex types
-        if re.search(r'\bARRAY\s*\[', query_upper):
+        if re.search(r"\bARRAY\s*\[", query_upper):
             features.append("Array Literals")
-        if re.search(r'\bMAP\s*\(', query_upper) or re.search(r'\bMAP\s*\{', query):
+        if re.search(r"\bMAP\s*\(", query_upper) or re.search(r"\bMAP\s*\{", query):
             features.append("Map Literals")
-        if re.search(r'\bROW\s*\(', query_upper):
+        if re.search(r"\bROW\s*\(", query_upper):
             features.append("Row/Struct Types")
 
         # GROUPING SETS, CUBE, ROLLUP
-        if re.search(r'\bGROUPING\s+SETS\s*\(', query_upper):
+        if re.search(r"\bGROUPING\s+SETS\s*\(", query_upper):
             features.append("GROUPING SETS")
-        if re.search(r'\bCUBE\s*\(', query_upper):
+        if re.search(r"\bCUBE\s*\(", query_upper):
             features.append("CUBE")
-        if re.search(r'\bROLLUP\s*\(', query_upper):
+        if re.search(r"\bROLLUP\s*\(", query_upper):
             features.append("ROLLUP")
 
         # TABLESAMPLE
-        if re.search(r'\bTABLESAMPLE\s+', query_upper):
+        if re.search(r"\bTABLESAMPLE\s+", query_upper):
             features.append("TABLESAMPLE")
 
         # Subqueries in FROM (derived tables)
-        if re.search(r'\bFROM\s*\(\s*SELECT\b', query_upper):
+        if re.search(r"\bFROM\s*\(\s*SELECT\b", query_upper):
             features.append("Derived Tables")
 
         # CROSS JOIN UNNEST
-        if re.search(r'\bCROSS\s+JOIN\s+UNNEST\s*\(', query_upper):
+        if re.search(r"\bCROSS\s+JOIN\s+UNNEST\s*\(", query_upper):
             features.append("CROSS JOIN UNNEST")
 
         # LATERAL
-        if re.search(r'\bLATERAL\s*\(', query_upper):
+        if re.search(r"\bLATERAL\s*\(", query_upper):
             features.append("LATERAL")
 
         return list(set(features))  # Remove duplicates
@@ -651,8 +662,6 @@ class AthenaExportAnalyser:
 
     def _analyze_query_complexity(self, query: str, query_id: str = "") -> Dict:
         """Analyze query complexity for migration readiness assessment."""
-        import re
-
         query_upper = query.upper()
         complexity = {
             "join_count": 0,
@@ -667,14 +676,14 @@ class AthenaExportAnalyser:
 
         # Count JOINs by type
         join_patterns = [
-            (r'\bLEFT\s+OUTER\s+JOIN\b', "LEFT OUTER"),
-            (r'\bRIGHT\s+OUTER\s+JOIN\b', "RIGHT OUTER"),
-            (r'\bFULL\s+OUTER\s+JOIN\b', "FULL OUTER"),
-            (r'\bLEFT\s+JOIN\b', "LEFT"),
-            (r'\bRIGHT\s+JOIN\b', "RIGHT"),
-            (r'\bINNER\s+JOIN\b', "INNER"),
-            (r'\bCROSS\s+JOIN\b', "CROSS"),
-            (r'\bJOIN\b', "JOIN"),  # Catch remaining JOINs
+            (r"\bLEFT\s+OUTER\s+JOIN\b", "LEFT OUTER"),
+            (r"\bRIGHT\s+OUTER\s+JOIN\b", "RIGHT OUTER"),
+            (r"\bFULL\s+OUTER\s+JOIN\b", "FULL OUTER"),
+            (r"\bLEFT\s+JOIN\b", "LEFT"),
+            (r"\bRIGHT\s+JOIN\b", "RIGHT"),
+            (r"\bINNER\s+JOIN\b", "INNER"),
+            (r"\bCROSS\s+JOIN\b", "CROSS"),
+            (r"\bJOIN\b", "JOIN"),  # Catch remaining JOINs
         ]
 
         counted_positions = set()
@@ -683,8 +692,15 @@ class AthenaExportAnalyser:
                 if match.start() not in counted_positions:
                     # Avoid double-counting (e.g., LEFT JOIN counted as both LEFT and JOIN)
                     if join_type == "JOIN" and any(
-                        p in query_upper[max(0, match.start() - 10):match.start()]
-                        for p in ["LEFT ", "RIGHT ", "INNER ", "CROSS ", "OUTER ", "FULL "]
+                        p in query_upper[max(0, match.start() - 10) : match.start()]
+                        for p in [
+                            "LEFT ",
+                            "RIGHT ",
+                            "INNER ",
+                            "CROSS ",
+                            "OUTER ",
+                            "FULL ",
+                        ]
                     ):
                         continue
                     complexity["join_count"] += 1
@@ -693,68 +709,78 @@ class AthenaExportAnalyser:
                     counted_positions.add(match.start())
 
         # Count CTEs
-        cte_matches = re.findall(r'\bWITH\s+(\w+)\s+AS\s*\(', query_upper)
+        cte_matches = re.findall(r"\bWITH\s+(\w+)\s+AS\s*\(", query_upper)
         complexity["cte_count"] = len(cte_matches)
         if complexity["cte_count"] > 0:
             self.cte_usage_count += 1
 
         # Count nested subqueries (estimate depth)
-        subquery_count = len(re.findall(r'\(\s*SELECT\b', query_upper))
+        subquery_count = len(re.findall(r"\(\s*SELECT\b", query_upper))
         complexity["subquery_depth"] = subquery_count
 
         # Count UNIONs
-        complexity["union_count"] = len(re.findall(r'\bUNION\s+(ALL\s+)?', query_upper))
+        complexity["union_count"] = len(re.findall(r"\bUNION\s+(ALL\s+)?", query_upper))
 
         # Check for GROUP BY
-        complexity["has_group_by"] = bool(re.search(r'\bGROUP\s+BY\b', query_upper))
+        complexity["has_group_by"] = bool(re.search(r"\bGROUP\s+BY\b", query_upper))
 
         # Check for aggregations
-        agg_funcs = r'\b(COUNT|SUM|AVG|MIN|MAX|ARRAY_AGG|STRING_AGG)\s*\('
+        agg_funcs = r"\b(COUNT|SUM|AVG|MIN|MAX|ARRAY_AGG|STRING_AGG)\s*\("
         complexity["has_aggregation"] = bool(re.search(agg_funcs, query_upper))
 
         # Flag potential missing GROUP BY (aggregation without GROUP BY, but not simple counts)
         if complexity["has_aggregation"] and not complexity["has_group_by"]:
             # Check if it's selecting non-aggregated columns too
-            if re.search(r'SELECT\s+(?!.*\bCOUNT\s*\(\s*\*\s*\)\s*$)', query_upper):
+            if re.search(r"SELECT\s+(?!.*\bCOUNT\s*\(\s*\*\s*\)\s*$)", query_upper):
                 complexity["potential_missing_group_by"] = True
 
         # Track high complexity queries
         if complexity["join_count"] >= 3 or complexity["subquery_depth"] >= 3:
-            self.high_complexity_queries.append({
-                "query_id": query_id,
-                "join_count": complexity["join_count"],
-                "join_types": complexity["join_types"],
-                "cte_count": complexity["cte_count"],
-                "subquery_depth": complexity["subquery_depth"],
-                "query_preview": query[:500],
-            })
+            self.high_complexity_queries.append(
+                {
+                    "query_id": query_id,
+                    "join_count": complexity["join_count"],
+                    "join_types": complexity["join_types"],
+                    "cte_count": complexity["cte_count"],
+                    "subquery_depth": complexity["subquery_depth"],
+                    "query_preview": query[:500],
+                }
+            )
 
         if complexity["join_count"] >= 2:
             self.queries_with_multiple_joins += 1
 
         return complexity
 
-    def _detect_ddl_operation(self, query: str, user: str, event_time: str) -> Optional[Dict]:
+    def _detect_ddl_operation(
+        self, query: str, user: str, event_time: str
+    ) -> Optional[Dict]:
         """Detect and track DDL operations."""
-        import re
-
         query_upper = query.upper().strip()
         ddl_info = None
 
         # DDL patterns
         ddl_patterns = [
-            (r'^CREATE\s+(OR\s+REPLACE\s+)?(EXTERNAL\s+)?(TABLE|VIEW|SCHEMA|DATABASE)', "CREATE"),
-            (r'^DROP\s+(TABLE|VIEW|SCHEMA|DATABASE)', "DROP"),
-            (r'^ALTER\s+(TABLE|VIEW|SCHEMA|DATABASE)', "ALTER"),
-            (r'^TRUNCATE\s+TABLE', "TRUNCATE"),
-            (r'^MSCK\s+REPAIR\s+TABLE', "REPAIR"),
+            (
+                r"^CREATE\s+(OR\s+REPLACE\s+)?(EXTERNAL\s+)?(TABLE|VIEW|SCHEMA|DATABASE)",
+                "CREATE",
+            ),
+            (r"^DROP\s+(TABLE|VIEW|SCHEMA|DATABASE)", "DROP"),
+            (r"^ALTER\s+(TABLE|VIEW|SCHEMA|DATABASE)", "ALTER"),
+            (r"^TRUNCATE\s+TABLE", "TRUNCATE"),
+            (r"^MSCK\s+REPAIR\s+TABLE", "REPAIR"),
         ]
 
         for pattern, ddl_type in ddl_patterns:
             if re.match(pattern, query_upper):
                 # Extract table name if possible
-                table_match = re.search(r'(TABLE|VIEW)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?([`"\']?\w+[`"\']?\.)?([`"\']?\w+[`"\']?)', query_upper)
-                table_name = table_match.group(3).strip('`"\'') if table_match else "unknown"
+                table_match = re.search(
+                    r'(TABLE|VIEW)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?([`"\']?\w+[`"\']?\.)?([`"\']?\w+[`"\']?)',
+                    query_upper,
+                )
+                table_name = (
+                    table_match.group(3).strip("`\"'") if table_match else "unknown"
+                )
 
                 # Parse hour from event time
                 hour = 0
@@ -786,8 +812,6 @@ class AthenaExportAnalyser:
 
     def _analyze_partition_usage(self, query: str) -> Dict:
         """Analyze partition column usage in queries."""
-        import re
-
         query_upper = query.upper()
         result = {
             "has_where_clause": False,
@@ -797,25 +821,36 @@ class AthenaExportAnalyser:
 
         # Common partition column names
         partition_columns = [
-            "partition", "dt", "date", "year", "month", "day",
-            "region", "country", "event_date", "created_date",
-            "load_date", "process_date", "etl_date", "p_date",
+            "partition",
+            "dt",
+            "date",
+            "year",
+            "month",
+            "day",
+            "region",
+            "country",
+            "event_date",
+            "created_date",
+            "load_date",
+            "process_date",
+            "etl_date",
+            "p_date",
         ]
 
         # Check for WHERE clause
-        result["has_where_clause"] = bool(re.search(r'\bWHERE\b', query_upper))
+        result["has_where_clause"] = bool(re.search(r"\bWHERE\b", query_upper))
 
         if result["has_where_clause"]:
             # Check if any partition-like columns are in WHERE
             for col in partition_columns:
-                if re.search(rf'\bWHERE\b.*\b{col.upper()}\s*[=<>]', query_upper):
+                if re.search(rf"\bWHERE\b.*\b{col.upper()}\s*[=<>]", query_upper):
                     result["potential_partition_filters"].append(col)
                     self.partition_columns_detected[col] += 1
 
         # Check if it's a SELECT without WHERE (likely full scan)
-        if re.match(r'^\s*SELECT\b', query_upper) and not result["has_where_clause"]:
+        if re.match(r"^\s*SELECT\b", query_upper) and not result["has_where_clause"]:
             # But not if it's a LIMIT 1 or small limit
-            if not re.search(r'\bLIMIT\s+[1-9]\d{0,1}\b', query_upper):
+            if not re.search(r"\bLIMIT\s+[1-9]\d{0,1}\b", query_upper):
                 result["likely_full_scan"] = True
                 self.full_table_scans += 1
 
@@ -826,7 +861,9 @@ class AthenaExportAnalyser:
 
         return result
 
-    def _track_long_running_query(self, query: str, execution_time_ms: int, user: str, event_time: str) -> None:
+    def _track_long_running_query(
+        self, query: str, execution_time_ms: int, user: str, event_time: str
+    ) -> None:
         """Track long-running queries for migration readiness."""
         if execution_time_ms <= 0:
             return
@@ -851,33 +888,36 @@ class AthenaExportAnalyser:
 
     def _detect_migration_compatibility_flags(self, query: str) -> List[str]:
         """Detect SQL patterns that may need attention during migration."""
-        import re
-
         flags = []
         query_upper = query.upper()
 
         # CTAS (Create Table As Select)
-        if re.search(r'\bCREATE\s+(EXTERNAL\s+)?TABLE\s+.*\s+AS\s+SELECT\b', query_upper):
+        if re.search(
+            r"\bCREATE\s+(EXTERNAL\s+)?TABLE\s+.*\s+AS\s+SELECT\b", query_upper
+        ):
             flags.append("CTAS")
 
         # INSERT INTO with partitions
-        if re.search(r'\bINSERT\s+(INTO|OVERWRITE)\s+.*\bPARTITION\s*\(', query_upper):
+        if re.search(r"\bINSERT\s+(INTO|OVERWRITE)\s+.*\bPARTITION\s*\(", query_upper):
             flags.append("INSERT_WITH_PARTITION")
 
         # ACID table operations (Iceberg, Hudi, Delta)
-        if re.search(r'\bUSING\s+(ICEBERG|HUDI|DELTA)\b', query_upper):
+        if re.search(r"\bUSING\s+(ICEBERG|HUDI|DELTA)\b", query_upper):
             flags.append("ACID_TABLE")
-        if re.search(r'\bMERGE\s+INTO\b', query_upper):
+        if re.search(r"\bMERGE\s+INTO\b", query_upper):
             flags.append("MERGE_INTO")
-        if re.search(r'\bDELETE\s+FROM\b', query_upper):
+        if re.search(r"\bDELETE\s+FROM\b", query_upper):
             flags.append("DELETE_FROM")
-        if re.search(r'\bUPDATE\s+\w+\s+SET\b', query_upper):
+        if re.search(r"\bUPDATE\s+\w+\s+SET\b", query_upper):
             flags.append("UPDATE")
 
         # Geospatial functions
         geo_funcs = [
-            r'\bST_\w+\s*\(', r'\bGEOMETRY\b', r'\bPOINT\s*\(',
-            r'\bPOLYGON\s*\(', r'\bLINESTRING\s*\(',
+            r"\bST_\w+\s*\(",
+            r"\bGEOMETRY\b",
+            r"\bPOINT\s*\(",
+            r"\bPOLYGON\s*\(",
+            r"\bLINESTRING\s*\(",
         ]
         for pattern in geo_funcs:
             if re.search(pattern, query_upper):
@@ -885,25 +925,27 @@ class AthenaExportAnalyser:
                 break
 
         # JSON functions (Athena-specific syntax)
-        if re.search(r'\bJSON_EXTRACT\s*\(', query_upper):
+        if re.search(r"\bJSON_EXTRACT\s*\(", query_upper):
             flags.append("JSON_EXTRACT")
-        if re.search(r'\$\.', query):  # JSONPath
+        if re.search(r"\$\.", query):  # JSONPath
             flags.append("JSONPATH")
 
         # Federated queries
-        if re.search(r'\bFROM\s+\w+\.\w+\.\w+\.\w+', query_upper):  # catalog.schema.table pattern
+        if re.search(
+            r"\bFROM\s+\w+\.\w+\.\w+\.\w+", query_upper
+        ):  # catalog.schema.table pattern
             flags.append("FEDERATED_QUERY")
 
         # Athena-specific UNLOAD
-        if re.search(r'\bUNLOAD\s*\(', query_upper):
+        if re.search(r"\bUNLOAD\s*\(", query_upper):
             flags.append("UNLOAD")
 
         # EXPLAIN or EXPLAIN ANALYZE
-        if re.search(r'^\s*EXPLAIN\b', query_upper):
+        if re.search(r"^\s*EXPLAIN\b", query_upper):
             flags.append("EXPLAIN")
 
         # Prepared statements
-        if re.search(r'\bPREPARE\b|\bEXECUTE\b|\bDEALLOCATE\b', query_upper):
+        if re.search(r"\bPREPARE\b|\bEXECUTE\b|\bDEALLOCATE\b", query_upper):
             flags.append("PREPARED_STATEMENTS")
 
         return flags
@@ -916,24 +958,34 @@ class AthenaExportAnalyser:
 
         # Query Complexity (max 30 points)
         high_complexity_pct = (
-            len(self.high_complexity_queries) / max(1, len(self.all_athena_events)) * 100
+            len(self.high_complexity_queries)
+            / max(1, len(self.all_athena_events))
+            * 100
         )
         if high_complexity_pct > 10:
             complexity_score += 30
-            considerations.append(f"HIGH: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting")
+            considerations.append(
+                f"HIGH: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting"
+            )
         elif high_complexity_pct > 5:
             complexity_score += 20
-            considerations.append(f"MEDIUM: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting")
+            considerations.append(
+                f"MEDIUM: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting"
+            )
         elif high_complexity_pct > 1:
             complexity_score += 10
-            considerations.append(f"LOW: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting")
+            considerations.append(
+                f"LOW: {high_complexity_pct:.1f}% queries have 3+ JOINs or deep nesting"
+            )
 
         # DDL Operations (max 20 points)
         total_ddl = sum(self.ddl_by_type.values())
         drop_count = self.ddl_by_type.get("DROP", 0)
         if drop_count > 20:
             complexity_score += 20
-            considerations.append(f"HIGH: {drop_count} DROP operations detected - review DDL patterns")
+            considerations.append(
+                f"HIGH: {drop_count} DROP operations detected - review DDL patterns"
+            )
         elif drop_count > 10:
             complexity_score += 15
             considerations.append(f"MEDIUM: {drop_count} DROP operations detected")
@@ -944,24 +996,38 @@ class AthenaExportAnalyser:
         # Long-running Queries (max 20 points)
         if self.queries_over_1hr > 5:
             complexity_score += 20
-            considerations.append(f"HIGH: {self.queries_over_1hr} queries run over 1 hour")
+            considerations.append(
+                f"HIGH: {self.queries_over_1hr} queries run over 1 hour"
+            )
         elif len(self.very_long_queries) > 10:
             complexity_score += 15
-            considerations.append(f"MEDIUM: {len(self.very_long_queries)} queries run over 30 minutes")
+            considerations.append(
+                f"MEDIUM: {len(self.very_long_queries)} queries run over 30 minutes"
+            )
         elif len(self.long_running_queries) > 20:
             complexity_score += 10
-            considerations.append(f"LOW: {len(self.long_running_queries)} queries run over 10 minutes")
+            considerations.append(
+                f"LOW: {len(self.long_running_queries)} queries run over 10 minutes"
+            )
 
         # Full Table Scans (max 15 points)
-        total_selects = sum(1 for e in self.all_athena_events if "SELECT" in str(e.get("query", "")).upper())
+        total_selects = sum(
+            1
+            for e in self.all_athena_events
+            if "SELECT" in str(e.get("query", "")).upper()
+        )
         if total_selects > 0:
             scan_pct = self.full_table_scans / total_selects * 100
             if scan_pct > 30:
                 complexity_score += 15
-                considerations.append(f"HIGH: {scan_pct:.1f}% of SELECT queries appear to be full table scans")
+                considerations.append(
+                    f"HIGH: {scan_pct:.1f}% of SELECT queries appear to be full table scans"
+                )
             elif scan_pct > 15:
                 complexity_score += 10
-                considerations.append(f"MEDIUM: {scan_pct:.1f}% of SELECT queries appear to be full table scans")
+                considerations.append(
+                    f"MEDIUM: {scan_pct:.1f}% of SELECT queries appear to be full table scans"
+                )
 
         # SQL Compatibility (max 15 points)
         compatibility_issues = 0
@@ -970,10 +1036,14 @@ class AthenaExportAnalyser:
                 compatibility_issues += len(examples)
         if compatibility_issues > 20:
             complexity_score += 15
-            considerations.append(f"HIGH: {compatibility_issues} queries use features requiring migration attention")
+            considerations.append(
+                f"HIGH: {compatibility_issues} queries use features requiring migration attention"
+            )
         elif compatibility_issues > 5:
             complexity_score += 10
-            considerations.append(f"MEDIUM: {compatibility_issues} queries use features requiring migration attention")
+            considerations.append(
+                f"MEDIUM: {compatibility_issues} queries use features requiring migration attention"
+            )
 
         # Determine readiness level (inverted - lower complexity = higher readiness)
         if complexity_score >= 60:
@@ -993,7 +1063,8 @@ class AthenaExportAnalyser:
             "high_complexity_queries": len(self.high_complexity_queries),
             "ddl_operations": total_ddl,
             "drop_operations": self.ddl_by_type.get("DROP", 0),
-            "long_running_queries": len(self.long_running_queries) + len(self.very_long_queries),
+            "long_running_queries": len(self.long_running_queries)
+            + len(self.very_long_queries),
             "full_table_scans": self.full_table_scans,
             "compatibility_flags": sum(len(v) for v in self.migration_flags.values()),
         }
@@ -1006,15 +1077,25 @@ class AthenaExportAnalyser:
 
         if "timeout" in error_lower or "timed out" in error_lower:
             return "Timeout"
-        elif "memory" in error_lower or "oom" in error_lower or "out of memory" in error_lower:
+        elif (
+            "memory" in error_lower
+            or "oom" in error_lower
+            or "out of memory" in error_lower
+        ):
             return "Memory Exceeded"
         elif "syntax" in error_lower or "parse" in error_lower:
             return "Syntax Error"
-        elif "permission" in error_lower or "access denied" in error_lower or "not authorized" in error_lower:
+        elif (
+            "permission" in error_lower
+            or "access denied" in error_lower
+            or "not authorized" in error_lower
+        ):
             return "Permission Denied"
         elif "does not exist" in error_lower or "not found" in error_lower:
             return "Resource Not Found"
-        elif "type" in error_lower and ("mismatch" in error_lower or "cannot be" in error_lower):
+        elif "type" in error_lower and (
+            "mismatch" in error_lower or "cannot be" in error_lower
+        ):
             return "Type Error"
         elif "division by zero" in error_lower:
             return "Division By Zero"
@@ -1074,7 +1155,9 @@ class AthenaExportAnalyser:
         lines.append(f"Total Athena Events:    {len(self.all_athena_events):,}")
         lines.append(f"Total S3 Events:        {len(self.all_s3_events):,}")
         lines.append(f"Total Queries:          {total_queries:,}")
-        lines.append(f"Total Data Scanned:     {self._format_bytes(total_data_scanned)}")
+        lines.append(
+            f"Total Data Scanned:     {self._format_bytes(total_data_scanned)}"
+        )
         lines.append(f"Unique Users:           {len(self.user_stats)}")
         lines.append(f"Unique Workgroups:      {len(self.workgroup_stats)}")
         lines.append(f"Unique Databases:       {len(self.database_stats)}")
@@ -1177,8 +1260,8 @@ class AthenaExportAnalyser:
             lines.append(f"Total Data Written:  {self._format_bytes(total_bytes_in)}")
             sorted_buckets = sorted(
                 self.s3_bucket_stats.items(),
-                key=lambda x: -(
-                    x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"]
+                key=lambda x: (
+                    -(x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"])
                 ),
             )[:10]
             for bucket, stats in sorted_buckets:
@@ -1190,8 +1273,12 @@ class AthenaExportAnalyser:
                 lines.append(f"    PUT:   {stats['put_count']:,}")
                 lines.append(f"    LIST:  {stats['list_count']:,}")
                 lines.append(f"    Total: {total_ops:,}")
-                lines.append(f"    Data Read:    {self._format_bytes(stats['bytes_out'])}")
-                lines.append(f"    Data Written: {self._format_bytes(stats['bytes_in'])}")
+                lines.append(
+                    f"    Data Read:    {self._format_bytes(stats['bytes_out'])}"
+                )
+                lines.append(
+                    f"    Data Written: {self._format_bytes(stats['bytes_in'])}"
+                )
                 lines.append(f"    Users: {len(stats['users'])}")
             lines.append("")
 
@@ -1267,15 +1354,17 @@ class AthenaExportAnalyser:
                 sorted_times = sorted(self.execution_times)
                 p50_ms = sorted_times[len(sorted_times) // 2]
                 p95_idx = int(len(sorted_times) * 0.95)
-                p95_ms = sorted_times[p95_idx] if p95_idx < len(sorted_times) else max_ms
+                p95_ms = (
+                    sorted_times[p95_idx] if p95_idx < len(sorted_times) else max_ms
+                )
 
                 lines.append("")
                 lines.append("  Execution Time Statistics:")
-                lines.append(f"    Min:    {min_ms:>10,} ms ({min_ms/1000:.1f}s)")
-                lines.append(f"    Avg:    {avg_ms:>10,.0f} ms ({avg_ms/1000:.1f}s)")
-                lines.append(f"    P50:    {p50_ms:>10,} ms ({p50_ms/1000:.1f}s)")
-                lines.append(f"    P95:    {p95_ms:>10,} ms ({p95_ms/1000:.1f}s)")
-                lines.append(f"    Max:    {max_ms:>10,} ms ({max_ms/1000:.1f}s)")
+                lines.append(f"    Min:    {min_ms:>10,} ms ({min_ms / 1000:.1f}s)")
+                lines.append(f"    Avg:    {avg_ms:>10,.0f} ms ({avg_ms / 1000:.1f}s)")
+                lines.append(f"    P50:    {p50_ms:>10,} ms ({p50_ms / 1000:.1f}s)")
+                lines.append(f"    P95:    {p95_ms:>10,} ms ({p95_ms / 1000:.1f}s)")
+                lines.append(f"    Max:    {max_ms:>10,} ms ({max_ms / 1000:.1f}s)")
             lines.append("")
 
         # Processing Errors
@@ -1452,8 +1541,8 @@ class AthenaExportAnalyser:
             fig, ax = plt.subplots(figsize=(12, 8))
             sorted_buckets = sorted(
                 self.s3_bucket_stats.items(),
-                key=lambda x: -(
-                    x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"]
+                key=lambda x: (
+                    -(x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"])
                 ),
             )[:10]
 
@@ -1513,8 +1602,6 @@ class AthenaExportAnalyser:
 
     def generate_html_report(self, output_path: str) -> None:
         """Generate an HTML report with embedded graphs."""
-        import base64
-
         # Generate graphs to memory
         graph_data = {}
 
@@ -1572,11 +1659,24 @@ class AthenaExportAnalyser:
             label = f"{count:,} ({pct:.1f}%)"
             # Place label inside or outside bar depending on width
             if pct > 15:
-                ax.text(width / 2, bar.get_y() + bar.get_height() / 2,
-                        label, ha="center", va="center", fontsize=9, fontweight="bold")
+                ax.text(
+                    width / 2,
+                    bar.get_y() + bar.get_height() / 2,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    fontweight="bold",
+                )
             else:
-                ax.text(width + total * 0.01, bar.get_y() + bar.get_height() / 2,
-                        label, ha="left", va="center", fontsize=9)
+                ax.text(
+                    width + total * 0.01,
+                    bar.get_y() + bar.get_height() / 2,
+                    label,
+                    ha="left",
+                    va="center",
+                    fontsize=9,
+                )
 
         ax.set_yticks(range(len(labels)))
         ax.set_yticklabels(labels, fontsize=10)
@@ -1707,7 +1807,9 @@ class AthenaExportAnalyser:
         )[:8]
 
         # Show full bucket names (up to 60 chars) for better readability
-        buckets = [b[0][:60] + ("..." if len(b[0]) > 60 else "") for b in sorted_buckets]
+        buckets = [
+            b[0][:60] + ("..." if len(b[0]) > 60 else "") for b in sorted_buckets
+        ]
         gets = [b[1]["get_count"] for b in sorted_buckets]
         puts = [b[1]["put_count"] for b in sorted_buckets]
         lists = [b[1]["list_count"] for b in sorted_buckets]
@@ -1812,7 +1914,15 @@ class AthenaExportAnalyser:
         counts = [self.execution_time_buckets.get(b, 0) for b in bucket_order]
 
         # Color gradient from green (fast) to red (slow)
-        colors = ["#28a745", "#5cb85c", "#8bc34a", "#ffc107", "#ff9800", "#ff5722", "#dc3545"]
+        colors = [
+            "#28a745",
+            "#5cb85c",
+            "#8bc34a",
+            "#ffc107",
+            "#ff9800",
+            "#ff5722",
+            "#dc3545",
+        ]
 
         bars = ax.bar(range(len(bucket_order)), counts, color=colors)
         ax.set_xticks(range(len(bucket_order)))
@@ -1914,7 +2024,7 @@ class AthenaExportAnalyser:
             <div class="time-range">
                 <h3>Analysis Period</h3>
                 <div class="period">{time_range_str}</div>
-                <div class="duration">Duration: {duration_str} | Export Files: {len(self.all_summaries)}</div>
+                <div class="duration">Duration: {duration_str} | Export Files: {len(self.all_summaries)}{f" | Mode: {'AWS Organizations' if self.multi_account_method == 'org' else 'Multi-Account'} ({len(self.per_account_summaries)} accounts)" if self.per_account_summaries else ""}</div>
             </div>
 
             <h2 style="margin-top: 0;">Overview</h2>
@@ -2086,8 +2196,8 @@ class AthenaExportAnalyser:
 
             sorted_buckets = sorted(
                 self.s3_bucket_stats.items(),
-                key=lambda x: -(
-                    x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"]
+                key=lambda x: (
+                    -(x[1]["get_count"] + x[1]["put_count"] + x[1]["list_count"])
                 ),
             )[:10]
             html += """
@@ -2126,7 +2236,9 @@ class AthenaExportAnalyser:
                 <img src="data:image/png;base64,{graph_data["sql_features"]}" alt="SQL Features">
             </div>
 """
-            sorted_features = sorted(self.sql_features.items(), key=lambda x: -x[1])[:15]
+            sorted_features = sorted(self.sql_features.items(), key=lambda x: -x[1])[
+                :15
+            ]
             html += """
             <table>
                 <tr><th>Feature</th><th>Occurrences</th><th>Notes</th></tr>
@@ -2166,7 +2278,9 @@ class AthenaExportAnalyser:
             failed_count = self.query_status_counts.get("FAILED", 0)
             succeeded_count = self.query_status_counts.get("SUCCEEDED", 0)
             total_status = sum(self.query_status_counts.values())
-            failure_rate = (failed_count / total_status * 100) if total_status > 0 else 0
+            failure_rate = (
+                (failed_count / total_status * 100) if total_status > 0 else 0
+            )
 
             html += f"""
         <div class="card">
@@ -2198,9 +2312,14 @@ class AthenaExportAnalyser:
             <table>
                 <tr><th>Error Type</th><th>Count</th><th>Example</th></tr>
 """
-                for error_type, count in sorted(self.error_types.items(), key=lambda x: -x[1]):
+                for error_type, count in sorted(
+                    self.error_types.items(), key=lambda x: -x[1]
+                ):
                     example = ""
-                    if error_type in self.error_examples and self.error_examples[error_type]:
+                    if (
+                        error_type in self.error_examples
+                        and self.error_examples[error_type]
+                    ):
                         example = self.error_examples[error_type][0][:100]
                         if len(self.error_examples[error_type][0]) > 100:
                             example += "..."
@@ -2238,28 +2357,30 @@ class AthenaExportAnalyser:
                 sorted_times = sorted(self.execution_times)
                 p50_ms = sorted_times[len(sorted_times) // 2]
                 p95_idx = int(len(sorted_times) * 0.95)
-                p95_ms = sorted_times[p95_idx] if p95_idx < len(sorted_times) else max_ms
+                p95_ms = (
+                    sorted_times[p95_idx] if p95_idx < len(sorted_times) else max_ms
+                )
 
                 html += f"""
             <div class="stats-grid" style="margin-top: 20px;">
                 <div class="stat-box" style="background: linear-gradient(135deg, #28a745, #218838);">
-                    <div class="value">{min_ms/1000:.1f}s</div>
+                    <div class="value">{min_ms / 1000:.1f}s</div>
                     <div class="label">Minimum</div>
                 </div>
                 <div class="stat-box" style="background: linear-gradient(135deg, #17a2b8, #138496);">
-                    <div class="value">{avg_ms/1000:.1f}s</div>
+                    <div class="value">{avg_ms / 1000:.1f}s</div>
                     <div class="label">Average</div>
                 </div>
                 <div class="stat-box" style="background: linear-gradient(135deg, #ffc107, #e0a800);">
-                    <div class="value">{p50_ms/1000:.1f}s</div>
+                    <div class="value">{p50_ms / 1000:.1f}s</div>
                     <div class="label">Median (P50)</div>
                 </div>
                 <div class="stat-box" style="background: linear-gradient(135deg, #ff9800, #f57c00);">
-                    <div class="value">{p95_ms/1000:.1f}s</div>
+                    <div class="value">{p95_ms / 1000:.1f}s</div>
                     <div class="label">P95</div>
                 </div>
                 <div class="stat-box" style="background: linear-gradient(135deg, #dc3545, #c82333);">
-                    <div class="value">{max_ms/1000:.1f}s</div>
+                    <div class="value">{max_ms / 1000:.1f}s</div>
                     <div class="label">Maximum</div>
                 </div>
             </div>
@@ -2393,7 +2514,9 @@ class AthenaExportAnalyser:
             <table>
                 <tr><th>JOIN Type</th><th>Count</th></tr>
 """
-            for join_type, count in sorted(self.join_type_counts.items(), key=lambda x: -x[1]):
+            for join_type, count in sorted(
+                self.join_type_counts.items(), key=lambda x: -x[1]
+            ):
                 html += f"""
                 <tr><td>{join_type}</td><td>{count:,}</td></tr>
 """
@@ -2408,7 +2531,9 @@ class AthenaExportAnalyser:
             <div style="max-height: 500px; overflow-y: auto;">
 """
             for i, q in enumerate(self.high_complexity_queries[:10], 1):
-                join_types_str = ", ".join(q["join_types"][:5]) if q["join_types"] else "N/A"
+                join_types_str = (
+                    ", ".join(q["join_types"][:5]) if q["join_types"] else "N/A"
+                )
                 preview = q["query_preview"]
                 html += f"""
                 <div style="margin-bottom: 15px; padding: 10px; background: #fff3cd; border-radius: 5px;">
@@ -2463,9 +2588,17 @@ class AthenaExportAnalyser:
 """
                 # Group by type
                 for ddl_type in ["DROP", "CREATE", "ALTER", "TRUNCATE"]:
-                    type_ops = [op for op in self.ddl_operations if op["type"] == ddl_type]
+                    type_ops = [
+                        op for op in self.ddl_operations if op["type"] == ddl_type
+                    ]
                     if type_ops:
-                        color = "#dc3545" if ddl_type == "DROP" else "#28a745" if ddl_type == "CREATE" else "#ffc107"
+                        color = (
+                            "#dc3545"
+                            if ddl_type == "DROP"
+                            else "#28a745"
+                            if ddl_type == "CREATE"
+                            else "#ffc107"
+                        )
                         html += f'<h4 style="color: {color};">{ddl_type} ({len(type_ops)})</h4>'
                         for op in type_ops[:10]:  # Show up to 10 per type
                             html += f"""
@@ -2475,7 +2608,7 @@ class AthenaExportAnalyser:
                 </div>
 """
                         if len(type_ops) > 10:
-                            html += f'<p><em>... and {len(type_ops) - 10} more {ddl_type} operations</em></p>'
+                            html += f"<p><em>... and {len(type_ops) - 10} more {ddl_type} operations</em></p>"
                 html += """
             </div>
 """
@@ -2487,7 +2620,9 @@ class AthenaExportAnalyser:
             <table>
                 <tr><th>User</th><th>CREATE</th><th>DROP</th><th>ALTER</th><th>Total</th></tr>
 """
-                for user, ops in sorted(self.ddl_by_user.items(), key=lambda x: -sum(x[1].values()))[:10]:
+                for user, ops in sorted(
+                    self.ddl_by_user.items(), key=lambda x: -sum(x[1].values())
+                )[:10]:
                     total_user_ddl = sum(ops.values())
                     html += f"""
                 <tr>
@@ -2513,7 +2648,6 @@ class AthenaExportAnalyser:
             <h2>Long-Running Query Analysis</h2>
 """
 
-        total_long = len(self.long_running_queries) + len(self.very_long_queries)
         html += f"""
             <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px;">
                 <div class="metric">
@@ -2536,7 +2670,12 @@ class AthenaExportAnalyser:
             <h3>Very Long Queries (30+ minutes)</h3>
             <div style="max-height: 400px; overflow-y: auto;">
 """
-            for i, q in enumerate(sorted(self.very_long_queries, key=lambda x: -x["execution_time_ms"])[:5], 1):
+            for i, q in enumerate(
+                sorted(self.very_long_queries, key=lambda x: -x["execution_time_ms"])[
+                    :5
+                ],
+                1,
+            ):
                 preview = q["query_preview"]
                 html += f"""
                 <div style="margin-bottom: 10px; padding: 10px; background: #f8d7da; border-radius: 5px;">
@@ -2574,7 +2713,9 @@ class AthenaExportAnalyser:
 
         # Data scan stats
         if self.data_scanned_per_query:
-            avg_scan = sum(self.data_scanned_per_query) / len(self.data_scanned_per_query)
+            avg_scan = sum(self.data_scanned_per_query) / len(
+                self.data_scanned_per_query
+            )
             max_scan = max(self.data_scanned_per_query)
             total_scan = sum(self.data_scanned_per_query)
             html += f"""
@@ -2591,7 +2732,9 @@ class AthenaExportAnalyser:
             <table>
                 <tr><th>User</th><th>Data Scanned</th></tr>
 """
-            for user, scanned in sorted(self.data_scanned_by_user.items(), key=lambda x: -x[1])[:10]:
+            for user, scanned in sorted(
+                self.data_scanned_by_user.items(), key=lambda x: -x[1]
+            )[:10]:
                 html += f"""
                 <tr><td>{user[:40]}</td><td>{self._format_bytes(scanned)}</td></tr>
 """
@@ -2612,8 +2755,12 @@ class AthenaExportAnalyser:
             <table>
                 <tr><th>Feature</th><th>Occurrences</th><th style="width: 60%;">Example</th></tr>
 """
-            for flag, examples in sorted(self.migration_flags.items(), key=lambda x: -len(x[1])):
-                example_preview = examples[0]["query_preview"][:300] if examples else "N/A"
+            for flag, examples in sorted(
+                self.migration_flags.items(), key=lambda x: -len(x[1])
+            ):
+                example_preview = (
+                    examples[0]["query_preview"][:300] if examples else "N/A"
+                )
                 html += f"""
                 <tr>
                     <td><strong>{flag}</strong></td>
@@ -2632,7 +2779,11 @@ class AthenaExportAnalyser:
         # Object size analysis
         if self.object_sizes:
             avg_size = sum(self.object_sizes) / len(self.object_sizes)
-            small_pct = self.small_file_count / len(self.object_sizes) * 100 if self.object_sizes else 0
+            small_pct = (
+                self.small_file_count / len(self.object_sizes) * 100
+                if self.object_sizes
+                else 0
+            )
 
             size_warning = ""
             if avg_size < 10 * 1024 * 1024:  # < 10MB
@@ -2659,38 +2810,105 @@ class AthenaExportAnalyser:
         recommendations = []
 
         if len(self.high_complexity_queries) > 0:
-            recommendations.append(f"Review {len(self.high_complexity_queries)} high-complexity queries with 3+ JOINs - these may cause query optimizer issues")
+            recommendations.append(
+                f"Review {len(self.high_complexity_queries)} high-complexity queries with 3+ JOINs - these may cause query optimizer issues"
+            )
 
         if self.ddl_by_type.get("DROP", 0) > 5:
             drop_count = self.ddl_by_type.get("DROP", 0)
-            recommendations.append(f"Review DDL patterns: {drop_count} DROP operations detected - consider implementing DDL governance")
+            recommendations.append(
+                f"Review DDL patterns: {drop_count} DROP operations detected - consider implementing DDL governance"
+            )
 
         if self.queries_over_1hr > 0:
-            recommendations.append(f"Investigate {self.queries_over_1hr} queries running over 1 hour - verify query cancellation capability in target platform")
+            recommendations.append(
+                f"Investigate {self.queries_over_1hr} queries running over 1 hour - verify query cancellation capability in target platform"
+            )
 
         if self.full_table_scans > 10:
-            recommendations.append(f"Optimize {self.full_table_scans} potential full table scans - verify scan limits in target platform")
+            recommendations.append(
+                f"Optimize {self.full_table_scans} potential full table scans - verify scan limits in target platform"
+            )
 
-        if self.object_sizes and sum(self.object_sizes) / len(self.object_sizes) < 50 * 1024 * 1024:
-            recommendations.append("Consider file compaction - small files cause API throttling and performance issues")
+        if (
+            self.object_sizes
+            and sum(self.object_sizes) / len(self.object_sizes) < 50 * 1024 * 1024
+        ):
+            recommendations.append(
+                "Consider file compaction - small files cause API throttling and performance issues"
+            )
 
         if self.cte_usage_count > 50:
-            recommendations.append(f"Review {self.cte_usage_count} queries using CTEs - these create temp result sets that stress Spark optimizer")
+            recommendations.append(
+                f"Review {self.cte_usage_count} queries using CTEs - these create temp result sets that stress Spark optimizer"
+            )
 
         for flag, examples in self.migration_flags.items():
             if flag == "GEOSPATIAL" and len(examples) > 0:
-                recommendations.append(f"Validate {len(examples)} geospatial queries - check Spark SQL compatibility")
+                recommendations.append(
+                    f"Validate {len(examples)} geospatial queries - check Spark SQL compatibility"
+                )
             if flag == "FEDERATED_QUERY" and len(examples) > 0:
-                recommendations.append(f"Plan migration for {len(examples)} federated queries - may require different approach in target platform")
+                recommendations.append(
+                    f"Plan migration for {len(examples)} federated queries - may require different approach in target platform"
+                )
 
         if not recommendations:
-            recommendations.append("No significant migration considerations detected - proceed with standard migration approach")
+            recommendations.append(
+                "No significant migration considerations detected - proceed with standard migration approach"
+            )
 
         for rec in recommendations:
             html += f"                <li>{rec}</li>\n"
 
         html += """
             </ul>
+        </div>
+"""
+
+        # Per-Account Breakdown (multi-account mode)
+        if self.per_account_summaries:
+            html += """
+        <div class="card">
+            <h2>Per-Account Breakdown</h2>
+            <table>
+                <tr>
+                    <th>Account ID</th>
+                    <th>Athena Events</th>
+                    <th>Queries Fetched</th>
+                    <th>Unique Users</th>
+                    <th>Workgroups</th>
+                    <th>Status</th>
+                </tr>
+"""
+            for acct in self.per_account_summaries:
+                acct_id = acct.get("account_id", "Unknown")
+                error = acct.get("error")
+                overview = acct.get("overview", {})
+                athena_events = overview.get("total_athena_events", 0)
+                queries_fetched = overview.get("queries_fetched_from_athena", 0)
+                unique_users = overview.get("unique_users", 0)
+                unique_wgs = overview.get("unique_workgroups", 0)
+
+                if error:
+                    status = f'<span style="color: #e74c3c;">{error}</span>'
+                elif athena_events == 0:
+                    status = '<span style="color: #f39c12;">No events</span>'
+                else:
+                    status = '<span style="color: #27ae60;">OK</span>'
+
+                html += f"""
+                <tr>
+                    <td><strong>{acct_id}</strong></td>
+                    <td>{athena_events:,}</td>
+                    <td>{queries_fetched:,}</td>
+                    <td>{unique_users}</td>
+                    <td>{unique_wgs}</td>
+                    <td>{status}</td>
+                </tr>
+"""
+            html += """
+            </table>
         </div>
 """
 
@@ -2715,28 +2933,8 @@ class AthenaExportAnalyser:
 console = Console()
 
 
-def _run_aws(args: List[str], region: Optional[str] = None) -> Tuple[bool, str]:
-    """Run an AWS CLI command. Returns (success, stdout_or_stderr)."""
-    cmd = ["aws"] + args
-    if region:
-        cmd += ["--region", region]
-    cmd += ["--output", "json", "--no-cli-pager"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    return False, result.stderr.strip()
-
-
-def _get_default_region() -> Optional[str]:
-    """Get the default region from AWS CLI config."""
-    result = subprocess.run(
-        ["aws", "configure", "get", "region"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-    return None
+_run_aws = run_aws
+_get_default_region = get_default_region
 
 
 def _get_stack_outputs(stack_name: str, region: str) -> Optional[Dict[str, str]]:
@@ -2784,9 +2982,7 @@ def _preflight_checks() -> Dict:
 
     # 1. AWS CLI
     with console.status("Checking AWS CLI..."):
-        result = subprocess.run(
-            ["aws", "--version"], capture_output=True, text=True
-        )
+        result = subprocess.run(["aws", "--version"], capture_output=True, text=True)
     if result.returncode != 0:
         console.print(
             Panel(
@@ -2888,9 +3084,7 @@ def _step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str,
         return region, stack_name, outputs
 
     stacks = json.loads(output).get("StackSummaries", [])
-    analyser_stacks = [
-        s for s in stacks if "athena" in s.get("StackName", "").lower()
-    ]
+    analyser_stacks = [s for s in stacks if "athena" in s.get("StackName", "").lower()]
 
     if not analyser_stacks:
         console.print("  [yellow]![/yellow] No Athena-related stacks found.")
@@ -2925,7 +3119,9 @@ def _step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str,
                     break
             except ValueError:
                 pass
-            console.print(f"  [red]✗[/red] Enter a number between 1 and {len(analyser_stacks)}.")
+            console.print(
+                f"  [red]✗[/red] Enter a number between 1 and {len(analyser_stacks)}."
+            )
 
     outputs = _get_stack_outputs(stack_name, region)
     if not outputs:
@@ -3064,7 +3260,9 @@ def _step_invoke_lambda(region: str, outputs: Dict[str, str]) -> None:
     if function_error:
         try:
             error_payload = Path(output_file).read_text()
-            console.print(f"  [red]✗[/red] Lambda returned an error: {error_payload[:500]}")
+            console.print(
+                f"  [red]✗[/red] Lambda returned an error: {error_payload[:500]}"
+            )
         except Exception:
             console.print(f"  [red]✗[/red] Lambda returned error: {function_error}")
         if not Confirm.ask("  Continue to download existing exports?", default=True):
@@ -3088,7 +3286,9 @@ def _step_invoke_lambda(region: str, outputs: Dict[str, str]) -> None:
         except Exception:
             pass
     else:
-        console.print(f"  [green]✓[/green] Lambda invocation completed (status: {status_code})")
+        console.print(
+            f"  [green]✓[/green] Lambda invocation completed (status: {status_code})"
+        )
 
     # Clean up temp file
     try:
@@ -3107,8 +3307,12 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     exports_s3_path = outputs.get("ExportsLocation", f"s3://{bucket_name}/exports/")
 
     if not bucket_name and not exports_s3_path:
-        console.print("  [red]✗[/red] Could not determine S3 bucket from stack outputs.")
-        exports_s3_path = Prompt.ask("  Enter S3 exports path (e.g. s3://bucket/exports/)")
+        console.print(
+            "  [red]✗[/red] Could not determine S3 bucket from stack outputs."
+        )
+        exports_s3_path = Prompt.ask(
+            "  Enter S3 exports path (e.g. s3://bucket/exports/)"
+        )
 
     # Local download directory
     default_dir = str(SCRIPT_DIR / "exports")
@@ -3147,7 +3351,9 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
         )
         sys.exit(0)
 
-    console.print(f"  [green]✓[/green] Downloaded {len(zip_files)} export{'s' if len(zip_files) != 1 else ''}")
+    console.print(
+        f"  [green]✓[/green] Downloaded {len(zip_files)} export{'s' if len(zip_files) != 1 else ''}"
+    )
 
     # Analyse directly
     console.print()
@@ -3225,95 +3431,7 @@ def _interactive_mode() -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Athena Usage Analyser — analyse exports and generate reports",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Modes:
-  Interactive (default):  Finds the deployed stack, invokes Lambda,
-                          downloads exports, and generates a report.
-  Direct (with path):     Analyses a local exports folder directly.
-
-Examples:
-  python3 analyse_exports.py                                   # Interactive mode
-  python3 analyse_exports.py ./exports/                        # Direct — HTML report
-  python3 analyse_exports.py ./exports/ --output report.txt    # Direct — text report
-  python3 analyse_exports.py ./exports/ --html report.html     # Direct — custom HTML path
-  python3 analyse_exports.py ./exports/ --graphs ./graphs/     # Direct — save graphs
-  python3 analyse_exports.py ./exports/ --no-open              # Direct — no auto-open
-        """,
-    )
-    parser.add_argument(
-        "exports_path", nargs="?", default=None,
-        help="Path to exports folder or single zip file (omit for interactive mode)",
-    )
-    parser.add_argument(
-        "--output", "-o", help="Output path for text report (instead of HTML)"
-    )
-    parser.add_argument(
-        "--html", help="Custom path for HTML report (default: auto-generated)"
-    )
-    parser.add_argument("--graphs", "-g", help="Directory to save graph images")
-    parser.add_argument(
-        "--quiet", "-q", action="store_true", help="Suppress console output"
-    )
-    parser.add_argument(
-        "--no-open", action="store_true", help="Do not auto-open the HTML report"
-    )
-
-    args = parser.parse_args()
-
-    # No path given → interactive mode
-    if args.exports_path is None:
-        _interactive_mode()
-        return
-
-    # Direct mode — analyse a local path
-    exports_path = Path(args.exports_path)
-    if not exports_path.exists():
-        print(f"Error: Path does not exist: {exports_path}")
-        sys.exit(1)
-
-    analyser = AthenaExportAnalyser(str(exports_path))
-    file_count = analyser.load_exports()
-
-    if file_count == 0:
-        print("No export files found to analyze.")
-        sys.exit(1)
-
-    html_path = None
-
-    if args.output:
-        report = analyser.generate_report(args.output)
-        if not args.quiet:
-            print("\n" + report)
-    else:
-        if args.html:
-            html_path = args.html
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            html_path = f"athena-usage-report-{timestamp}.html"
-
-        analyser.generate_html_report(html_path)
-
-        if not args.no_open:
-            abs_path = os.path.abspath(html_path)
-            print(f"Opening report in browser: {abs_path}")
-            try:
-                if sys.platform == "darwin":
-                    subprocess.run(["open", abs_path], check=True)
-                elif sys.platform == "win32":
-                    os.startfile(abs_path)
-                else:
-                    webbrowser.open(f"file://{abs_path}")
-            except Exception as e:
-                print(f"Could not auto-open file: {e}")
-                print(f"Please open manually: {abs_path}")
-
-    if args.graphs:
-        analyser.generate_graphs(args.graphs)
-
-    print("\nAnalysis complete!")
+    _interactive_mode()
 
 
 if __name__ == "__main__":

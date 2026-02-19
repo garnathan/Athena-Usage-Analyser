@@ -13,40 +13,16 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+import uuid
+import zipfile
+import io
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Auto-install rich if needed (same pattern as analyse_exports.py)
-REQUIRED_PACKAGES = ["rich"]
+from _helpers import install_dependencies, run_aws, get_default_region
 
-
-def install_dependencies():
-    """Install required packages if not already installed."""
-    for package in REQUIRED_PACKAGES:
-        try:
-            __import__(package)
-        except ImportError:
-            print(f"Installing required package: {package}...")
-            try:
-                subprocess.check_call(
-                    ["pip3", "install", "--user", package],
-                    stdout=subprocess.DEVNULL,
-                )
-                print(f"  {package} installed successfully.")
-            except subprocess.CalledProcessError:
-                try:
-                    subprocess.check_call(
-                        ["pip3", "install", "--break-system-packages", package],
-                        stdout=subprocess.DEVNULL,
-                    )
-                    print(f"  {package} installed successfully.")
-                except subprocess.CalledProcessError as e:
-                    print(f"  Failed to install {package}: {e}")
-                    print(f"  Please run: pip3 install {package}")
-                    sys.exit(1)
-
-
-install_dependencies()
+install_dependencies(["rich"])
 
 from rich import box
 from rich.console import Console
@@ -57,6 +33,8 @@ from rich.table import Table
 console = Console()
 
 TEMPLATE_REL_PATH = Path("cloudformation") / "athena-usage-analyser.json"
+CROSS_ACCOUNT_TEMPLATE_REL_PATH = Path("cloudformation") / "cross-account-role.json"
+LAMBDA_DIR = Path("lambda")
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -65,33 +43,62 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 
 
-def run_aws(args: List[str], region: Optional[str] = None) -> Tuple[bool, str]:
-    """Run an AWS CLI command. Returns (success, stdout_or_stderr)."""
-    cmd = ["aws"] + args
-    if region:
-        cmd += ["--region", region]
-    cmd += ["--output", "json", "--no-cli-pager"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        return True, result.stdout.strip()
-    return False, result.stderr.strip()
-
-
-def get_default_region() -> Optional[str]:
-    """Get the default region from AWS CLI config."""
-    result = subprocess.run(
-        ["aws", "configure", "get", "region"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-    return None
-
-
 def validate_stack_name(name: str) -> bool:
     """Validate CloudFormation stack name."""
     return bool(re.match(r"^[a-zA-Z][-a-zA-Z0-9]*$", name)) and len(name) <= 128
+
+
+def validate_account_id(account_id: str) -> bool:
+    """Validate a 12-digit AWS account ID."""
+    return bool(re.match(r"^\d{12}$", account_id))
+
+
+def package_lambda() -> bytes:
+    """Package the lambda/index.py into a zip file in memory. Returns zip bytes."""
+    lambda_path = SCRIPT_DIR / LAMBDA_DIR / "index.py"
+    if not lambda_path.exists():
+        console.print(
+            Panel(
+                f"[red]Lambda code not found.[/red]\n\nExpected: {lambda_path}",
+                title="Error",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(lambda_path, "index.py")
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def upload_lambda_code(bucket: str, stack_name: str, region: str) -> Tuple[str, str]:
+    """Package and upload Lambda code to S3. Returns (bucket, key)."""
+    s3_key = f"lambda-code/{stack_name}/index.zip"
+    zip_bytes = package_lambda()
+
+    # Write to temp file for upload
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(zip_bytes)
+        tmp_path = tmp.name
+
+    ok, output = run_aws(
+        [
+            "s3",
+            "cp",
+            tmp_path,
+            f"s3://{bucket}/{s3_key}",
+        ],
+        region=region,
+    )
+    # Clean up temp file
+    Path(tmp_path).unlink(missing_ok=True)
+
+    if not ok:
+        console.print(f"  [red]✗[/red] Failed to upload Lambda code: {output}")
+        sys.exit(1)
+
+    return bucket, s3_key
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +114,7 @@ def preflight_checks() -> Dict:
 
     # 1. AWS CLI
     with console.status("Checking AWS CLI..."):
-        result = subprocess.run(
-            ["aws", "--version"], capture_output=True, text=True
-        )
+        result = subprocess.run(["aws", "--version"], capture_output=True, text=True)
     if result.returncode != 0:
         console.print(
             Panel(
@@ -199,7 +204,9 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
 
     if not ok:
         console.print(f"  [red]✗[/red] Failed to query CloudTrail: {output}")
-        console.print("  [dim]Continuing — management events are logged by default.[/dim]")
+        console.print(
+            "  [dim]Continuing — management events are logged by default.[/dim]"
+        )
         return region, []
 
     trails_data = json.loads(output).get("trailList", [])
@@ -229,7 +236,9 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
 
     console.print()
     console.print(table)
-    console.print(f"\n  [green]✓[/green] CloudTrail is active ({len(trails_data)} trail{'s' if len(trails_data) != 1 else ''})")
+    console.print(
+        f"\n  [green]✓[/green] CloudTrail is active ({len(trails_data)} trail{'s' if len(trails_data) != 1 else ''})"
+    )
 
     return region, trails_data
 
@@ -283,7 +292,9 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
                     break
             except ValueError:
                 pass
-            console.print(f"  [red]✗[/red] Enter a number between 1 and {len(trail_names)}.")
+            console.print(
+                f"  [red]✗[/red] Enter a number between 1 and {len(trail_names)}."
+            )
         console.print(f"  Using trail: [cyan]{trail_name}[/cyan]")
 
     # Buckets to monitor — list account buckets and let user select
@@ -292,21 +303,17 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
         buckets_ok, buckets_output = run_aws(["s3api", "list-buckets"], region=region)
 
     if not buckets_ok:
-        console.print(f"  [yellow]![/yellow] Could not list S3 buckets: {buckets_output}")
-        console.print("  [dim]Enter bucket names manually instead.[/dim]")
-        buckets_input = Prompt.ask(
-            "  S3 buckets to monitor (comma-separated)"
+        console.print(
+            f"  [yellow]![/yellow] Could not list S3 buckets: {buckets_output}"
         )
+        console.print("  [dim]Enter bucket names manually instead.[/dim]")
+        buckets_input = Prompt.ask("  S3 buckets to monitor (comma-separated)")
         bucket_names = [b.strip() for b in buckets_input.split(",") if b.strip()]
     else:
-        all_buckets = [
-            b["Name"] for b in json.loads(buckets_output).get("Buckets", [])
-        ]
+        all_buckets = [b["Name"] for b in json.loads(buckets_output).get("Buckets", [])]
         if not all_buckets:
             console.print("  [yellow]![/yellow] No S3 buckets found in this account.")
-            buckets_input = Prompt.ask(
-                "  S3 buckets to monitor (comma-separated)"
-            )
+            buckets_input = Prompt.ask("  S3 buckets to monitor (comma-separated)")
             bucket_names = [b.strip() for b in buckets_input.split(",") if b.strip()]
         else:
             console.print()
@@ -315,16 +322,20 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
             console.print()
             while True:
                 selection = Prompt.ask(
-                    f"  Select buckets (comma-separated numbers, e.g. 1,3,5)"
+                    "  Select buckets (comma-separated numbers, e.g. 1,3,5)"
                 )
                 try:
-                    indices = [int(s.strip()) for s in selection.split(",") if s.strip()]
+                    indices = [
+                        int(s.strip()) for s in selection.split(",") if s.strip()
+                    ]
                     if indices and all(1 <= idx <= len(all_buckets) for idx in indices):
                         bucket_names = [all_buckets[idx - 1] for idx in indices]
                         break
                 except ValueError:
                     pass
-                console.print(f"  [red]✗[/red] Enter numbers between 1 and {len(all_buckets)}, separated by commas.")
+                console.print(
+                    f"  [red]✗[/red] Enter numbers between 1 and {len(all_buckets)}, separated by commas."
+                )
 
             for b in bucket_names:
                 console.print(f"  [green]✓[/green] {b}")
@@ -402,7 +413,336 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Configure & Deploy
+# Step 3: Analysis Mode
+# ---------------------------------------------------------------------------
+
+
+def step_analysis_mode(account_id: str, region: str) -> Dict:
+    """Ask whether to use single, multi-account, or AWS Organizations mode."""
+    console.print()
+    console.print("[bold]Step 3 · Analysis Mode[/bold]")
+    console.print()
+    console.print(
+        "  [bold]1[/bold]. Single account     [dim](analyse this account only)[/dim]"
+    )
+    console.print(
+        "  [bold]2[/bold]. Multi-account       [dim](analyse multiple AWS accounts via explicit IDs)[/dim]"
+    )
+    console.print(
+        "  [bold]3[/bold]. AWS Organizations   [dim](auto-discover accounts, use org trail)[/dim]"
+    )
+    console.print()
+
+    while True:
+        choice = Prompt.ask("  Select mode", choices=["1", "2", "3"], default="1")
+        if choice in ("1", "2", "3"):
+            break
+
+    if choice == "1":
+        console.print("  [green]✓[/green] Single-account mode")
+        return {"mode": "single"}
+
+    if choice == "3":
+        return step_org_setup(account_id, region)
+
+    # Multi-account mode (manual)
+    console.print()
+    console.print(
+        "  Multi-account mode analyses Athena usage across multiple AWS accounts.\n"
+        "  You will need to deploy a read-only IAM role in each monitored account."
+    )
+    console.print()
+
+    # Collect account IDs
+    while True:
+        accounts_input = Prompt.ask(
+            "  AWS account IDs to analyse [dim](comma-separated, 12-digit IDs)[/dim]"
+        )
+        account_ids = [a.strip() for a in accounts_input.split(",") if a.strip()]
+        if not account_ids:
+            console.print("  [red]✗[/red] At least one account ID is required.")
+            continue
+        invalid = [a for a in account_ids if not validate_account_id(a)]
+        if invalid:
+            console.print(
+                f"  [red]✗[/red] Invalid account IDs: {', '.join(invalid)}. "
+                "Must be 12 digits."
+            )
+            continue
+        if account_id in account_ids:
+            console.print(
+                f"  [yellow]![/yellow] Removed collector account {account_id} "
+                "(it will be analysed locally)."
+            )
+            account_ids = [a for a in account_ids if a != account_id]
+            if not account_ids:
+                console.print("  [red]✗[/red] No remote accounts remaining.")
+                continue
+        break
+
+    for aid in account_ids:
+        console.print(f"  [green]✓[/green] {aid}")
+
+    # ExternalId
+    console.print()
+    default_external_id = str(uuid.uuid4())
+    external_id = Prompt.ask(
+        "  ExternalId for cross-account trust [dim](auto-generated, or enter your own)[/dim]",
+        default=default_external_id,
+    )
+    console.print(f"  [green]✓[/green] ExternalId: {external_id}")
+
+    return {
+        "mode": "multi",
+        "method": "manual",
+        "account_ids": account_ids,
+        "external_id": external_id,
+    }
+
+
+def step_org_setup(account_id: str, region: str) -> Dict:
+    """Set up AWS Organizations mode. Auto-discovers org ID, accounts, and org trail."""
+    console.print()
+    console.print(
+        "  AWS Organizations mode auto-discovers member accounts and reads\n"
+        "  CloudTrail data from a centralized Organization Trail bucket."
+    )
+    console.print()
+
+    # 1. Discover organization
+    with console.status("  Checking AWS Organizations..."):
+        ok, output = run_aws(["organizations", "describe-organization"], region=region)
+
+    if not ok:
+        console.print(
+            Panel(
+                "[red]Failed to query AWS Organizations.[/red]\n\n"
+                "This account may not be the management account, or Organizations\n"
+                "is not enabled. Org mode requires the collector to run in the\n"
+                "management account (or a delegated administrator account).\n\n"
+                f"Error: {output}",
+                title="Organizations Not Available",
+                border_style="red",
+            )
+        )
+        console.print()
+        if Confirm.ask("  Fall back to manual multi-account mode?", default=True):
+            return step_analysis_mode(account_id, region)
+        sys.exit(0)
+
+    org_data = json.loads(output).get("Organization", {})
+    org_id = org_data.get("Id", "")
+    master_account_id = org_data.get("MasterAccountId", "")
+
+    console.print(f"  [green]✓[/green] Organization ID: {org_id}")
+    console.print(f"  [green]✓[/green] Management Account: {master_account_id}")
+
+    if master_account_id != account_id:
+        console.print(
+            f"\n  [yellow]![/yellow] This account ({account_id}) is not the management account.\n"
+            "  Org API calls may require delegated administrator permissions."
+        )
+
+    # 2. List accounts
+    console.print()
+    with console.status("  Discovering member accounts..."):
+        ok, output = run_aws(["organizations", "list-accounts"], region=region)
+
+    if not ok:
+        console.print(f"  [red]✗[/red] Failed to list accounts: {output}")
+        sys.exit(1)
+
+    all_accounts = json.loads(output).get("Accounts", [])
+    active_accounts = [a for a in all_accounts if a["Status"] == "ACTIVE"]
+    member_accounts = [a for a in active_accounts if a["Id"] != account_id]
+
+    acct_table = Table(box=box.ROUNDED, show_edge=True, pad_edge=True)
+    acct_table.add_column("Account ID", style="cyan")
+    acct_table.add_column("Name", style="white")
+    acct_table.add_column("Email", style="dim")
+
+    for a in active_accounts:
+        suffix = " (collector)" if a["Id"] == account_id else ""
+        acct_table.add_row(
+            a["Id"],
+            a.get("Name", "—") + suffix,
+            a.get("Email", "—"),
+        )
+
+    console.print(acct_table)
+    console.print(
+        f"\n  [green]✓[/green] {len(member_accounts)} member accounts to analyse"
+    )
+
+    # 3. Detect Organization Trail
+    console.print()
+    with console.status("  Looking for Organization CloudTrail trail..."):
+        ok, output = run_aws(["cloudtrail", "describe-trails"], region=region)
+
+    org_trail_bucket = ""
+    if ok:
+        trails = json.loads(output).get("trailList", [])
+        org_trails = [t for t in trails if t.get("IsOrganizationTrail")]
+        if org_trails:
+            org_trail = org_trails[0]
+            org_trail_bucket = org_trail.get("S3BucketName", "")
+            console.print(
+                f"  [green]✓[/green] Organization Trail found: {org_trail.get('Name')}"
+            )
+            console.print(f"  [green]✓[/green] Org Trail Bucket: {org_trail_bucket}")
+        else:
+            console.print("  [yellow]![/yellow] No Organization Trail found.")
+            console.print(
+                "  [dim]Without an org trail, the Lambda will read CloudTrail per-account\n"
+                "  via cross-account roles (same as manual multi-account mode).[/dim]"
+            )
+
+    if not org_trail_bucket:
+        org_trail_bucket = Prompt.ask(
+            "  Organization Trail S3 bucket [dim](leave empty to skip)[/dim]",
+            default="",
+        )
+
+    # 4. Cross-account roles (optional for query enrichment)
+    console.print()
+    console.print(
+        "  [bold]Cross-account roles (optional)[/bold]\n"
+        "  Org mode reads CloudTrail from the org trail bucket, so cross-account\n"
+        "  roles are only needed for Athena query enrichment (execution stats\n"
+        "  like data scanned and timing). Query strings are already in CloudTrail."
+    )
+    console.print()
+
+    want_enrichment = Confirm.ask(
+        "  Deploy cross-account roles for query enrichment?", default=True
+    )
+
+    external_id = ""
+    if want_enrichment:
+        default_external_id = str(uuid.uuid4())
+        external_id = Prompt.ask(
+            "  ExternalId for cross-account trust",
+            default=default_external_id,
+        )
+        console.print(f"  [green]✓[/green] ExternalId: {external_id}")
+
+    return {
+        "mode": "multi",
+        "method": "org",
+        "org_id": org_id,
+        "org_trail_bucket": org_trail_bucket,
+        "account_ids": [a["Id"] for a in member_accounts],
+        "external_id": external_id,
+        "want_enrichment": want_enrichment,
+    }
+
+
+def show_org_stacksets_instructions(
+    account_id: str,
+    stack_name: str,
+    external_id: str,
+    region: str,
+) -> None:
+    """Display StackSets deployment instructions for org mode."""
+    console.print()
+    console.print("[bold]Cross-Account Role Setup via StackSets[/bold]")
+    console.print()
+    console.print(
+        "  With AWS Organizations, you can deploy the cross-account role to\n"
+        "  all member accounts at once using CloudFormation StackSets."
+    )
+    console.print()
+
+    cmd = (
+        f"aws cloudformation create-stack-set \\\n"
+        f"  --stack-set-name AthenaUsageAnalyserRole \\\n"
+        f"  --template-body file://cloudformation/cross-account-role.json \\\n"
+        f"  --capabilities CAPABILITY_NAMED_IAM \\\n"
+        f"  --permission-model SERVICE_MANAGED \\\n"
+        f"  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \\\n"
+        f"  --parameters \\\n"
+        f"    ParameterKey=CollectorAccountId,ParameterValue={account_id} \\\n"
+        f"    ParameterKey=CollectorStackName,ParameterValue={stack_name} \\\n"
+        f"    ParameterKey=ExternalId,ParameterValue={external_id}\n\n"
+        f"# Then create instances in all accounts:\n"
+        f"aws cloudformation create-stack-instances \\\n"
+        f"  --stack-set-name AthenaUsageAnalyserRole \\\n"
+        f"  --deployment-targets OrganizationalUnitIds=<root-ou-id> \\\n"
+        f"  --regions {region}"
+    )
+
+    console.print(
+        Panel(
+            cmd,
+            title="Run in the management account",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    console.print()
+    console.print(
+        "  [dim]To find your root OU ID:[/dim]\n"
+        "  [dim]  aws organizations list-roots --query 'Roots[0].Id'[/dim]\n"
+        "\n"
+        "  [dim]Auto-deployment is enabled, so new accounts joining the org\n"
+        "  will automatically get the role deployed.[/dim]"
+    )
+    console.print()
+    Prompt.ask("  Press Enter to continue")
+
+
+def show_cross_account_instructions(
+    account_id: str,
+    stack_name: str,
+    external_id: str,
+    monitored_accounts: List[str],
+) -> None:
+    """Display cross-account role deployment instructions."""
+    console.print()
+    console.print("[bold]Cross-Account Role Setup[/bold]")
+    console.print()
+    console.print(
+        "  Deploy the following CloudFormation stack in [bold]each monitored account[/bold].\n"
+        "  This creates a read-only IAM role that allows the collector Lambda to\n"
+        "  access CloudTrail and Athena data."
+    )
+    console.print()
+
+    cmd = (
+        f"aws cloudformation create-stack \\\n"
+        f"  --stack-name AthenaUsageAnalyserRole \\\n"
+        f"  --template-body file://cloudformation/cross-account-role.json \\\n"
+        f"  --capabilities CAPABILITY_NAMED_IAM \\\n"
+        f"  --parameters \\\n"
+        f"    ParameterKey=CollectorAccountId,ParameterValue={account_id} \\\n"
+        f"    ParameterKey=CollectorStackName,ParameterValue={stack_name} \\\n"
+        f"    ParameterKey=ExternalId,ParameterValue={external_id}"
+    )
+
+    console.print(
+        Panel(
+            cmd,
+            title="Run in each monitored account",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    console.print(
+        f"  Accounts requiring this role: [bold]{', '.join(monitored_accounts)}[/bold]"
+    )
+    console.print()
+    console.print(
+        "  [dim]Note: You can deploy the role now or after the collector stack is created.\n"
+        "  The Lambda will log warnings for any accounts where the role is not yet available.[/dim]"
+    )
+    console.print()
+    Prompt.ask("  Press Enter to continue")
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Configure & Deploy
 # ---------------------------------------------------------------------------
 
 
@@ -411,10 +751,14 @@ def step_deploy(
     cloudtrail_bucket: Optional[str],
     template_path: Path,
     account_id: str,
+    analysis_config: Optional[Dict] = None,
 ) -> None:
     """Collect parameters, deploy stack, wait, show results."""
+    if analysis_config is None:
+        analysis_config = {"mode": "single"}
+
     console.print()
-    console.print("[bold]Step 3 · Configure & Deploy[/bold]")
+    console.print("[bold]Step 4 · Configure & Deploy[/bold]")
     console.print()
 
     # Stack name
@@ -429,9 +773,7 @@ def step_deploy(
     # CloudTrail bucket (only if S3 events were enabled)
     ct_bucket = ""
     if cloudtrail_bucket is not None:
-        ct_bucket = Prompt.ask(
-            "  CloudTrail S3 bucket", default=cloudtrail_bucket
-        )
+        ct_bucket = Prompt.ask("  CloudTrail S3 bucket", default=cloudtrail_bucket)
 
     # Workgroups
     workgroups = Prompt.ask(
@@ -446,9 +788,17 @@ def step_deploy(
     )
 
     # Defaults for advanced settings
-    interval = 10
+    interval = 60
     retention = 90
     kms_key = ""
+
+    # Multi-account settings
+    analysis_mode = analysis_config.get("mode", "single")
+    multi_account_method = analysis_config.get("method", "manual")
+    monitored_account_ids = ",".join(analysis_config.get("account_ids", []))
+    external_id = analysis_config.get("external_id", "")
+    org_id = analysis_config.get("org_id", "")
+    org_trail_bucket = analysis_config.get("org_trail_bucket", "")
 
     # Summary table
     console.print()
@@ -464,10 +814,33 @@ def step_deploy(
 
     summary.add_row("Stack Name", stack_name)
     summary.add_row("Region", region)
+    summary.add_row("Analysis Mode", analysis_mode)
+    if analysis_mode == "multi":
+        if multi_account_method == "org":
+            summary.add_row("Multi-Account Method", "AWS Organizations")
+            summary.add_row("Organization ID", org_id)
+            summary.add_row(
+                "Org Trail Bucket",
+                org_trail_bucket or "[dim]— (not set)[/dim]",
+            )
+            summary.add_row(
+                "Discovered Accounts",
+                str(len(analysis_config.get("account_ids", []))),
+            )
+        else:
+            summary.add_row(
+                "Monitored Accounts",
+                ", ".join(analysis_config.get("account_ids", [])),
+            )
     summary.add_row("Athena Workgroups", workgroups)
     summary.add_row("S3 Buckets to Monitor", s3_buckets)
     summary.add_row("CloudTrail Bucket", ct_bucket or "[dim]— (not set)[/dim]")
-    summary.add_row("Analysis Interval", f"{interval} minutes")
+    summary.add_row(
+        "Analysis Interval",
+        f"{interval // 60} hours"
+        if interval >= 60 and interval % 60 == 0
+        else f"{interval} minutes",
+    )
     summary.add_row("Retention", f"{retention} days")
     summary.add_row("KMS Key", kms_key or "[dim]None (AES-256)[/dim]")
 
@@ -479,16 +852,14 @@ def step_deploy(
         console.print()
         while True:
             interval = IntPrompt.ask(
-                "  Analysis interval (minutes, 5-60)", default=10
+                "  Analysis interval (minutes, 5-1440)", default=60
             )
-            if 5 <= interval <= 60:
+            if 5 <= interval <= 1440:
                 break
-            console.print("  [red]✗[/red] Must be between 5 and 60.")
+            console.print("  [red]✗[/red] Must be between 5 and 1440.")
 
         while True:
-            retention = IntPrompt.ask(
-                "  Retention period (days, 7-365)", default=90
-            )
+            retention = IntPrompt.ask("  Retention period (days, 7-365)", default=90)
             if 7 <= retention <= 365:
                 break
             console.print("  [red]✗[/red] Must be between 7 and 365.")
@@ -498,7 +869,9 @@ def step_deploy(
             default="",
         )
         if kms_key and not kms_key.startswith("arn:aws:kms:"):
-            console.print("  [yellow]![/yellow] That doesn't look like a KMS ARN — using it anyway.")
+            console.print(
+                "  [yellow]![/yellow] That doesn't look like a KMS ARN — using it anyway."
+            )
 
         # Redisplay summary
         console.print()
@@ -513,10 +886,21 @@ def step_deploy(
         summary.add_column("Value", style="white")
         summary.add_row("Stack Name", stack_name)
         summary.add_row("Region", region)
+        summary.add_row("Analysis Mode", analysis_mode)
+        if analysis_mode == "multi":
+            summary.add_row(
+                "Monitored Accounts",
+                ", ".join(analysis_config.get("account_ids", [])),
+            )
         summary.add_row("Athena Workgroups", workgroups)
         summary.add_row("S3 Buckets to Monitor", s3_buckets)
         summary.add_row("CloudTrail Bucket", ct_bucket or "[dim]— (not set)[/dim]")
-        summary.add_row("Analysis Interval", f"{interval} minutes")
+        summary.add_row(
+            "Analysis Interval",
+            f"{interval // 60} hours"
+            if interval >= 60 and interval % 60 == 0
+            else f"{interval} minutes",
+        )
         summary.add_row("Retention", f"{retention} days")
         summary.add_row("KMS Key", kms_key or "[dim]None (AES-256)[/dim]")
         console.print(summary)
@@ -551,9 +935,7 @@ def step_deploy(
                     stack_name = Prompt.ask("  New stack name")
                     if validate_stack_name(stack_name):
                         break
-                    console.print(
-                        "  [red]✗[/red] Invalid name."
-                    )
+                    console.print("  [red]✗[/red] Invalid name.")
             elif choice == "update":
                 is_update = True
 
@@ -563,17 +945,107 @@ def step_deploy(
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
 
+    # ---- Package and upload Lambda code ----
+    console.print()
+
+    # We need an S3 bucket for the Lambda code. For new stacks, we create a
+    # temporary bucket. For updates, we reuse the analysis bucket.
+    if is_update:
+        # Get the existing analysis bucket from stack outputs
+        _, desc_output = run_aws(
+            ["cloudformation", "describe-stacks", "--stack-name", stack_name],
+            region=region,
+        )
+        try:
+            stack_info = json.loads(desc_output).get("Stacks", [{}])[0]
+            code_bucket = None
+            for o in stack_info.get("Outputs", []):
+                if o["OutputKey"] == "AnalysisBucketName":
+                    code_bucket = o["OutputValue"]
+                    break
+            if not code_bucket:
+                console.print(
+                    "  [red]✗[/red] Could not find analysis bucket in stack outputs."
+                )
+                sys.exit(1)
+        except (json.JSONDecodeError, IndexError, KeyError):
+            console.print("  [red]✗[/red] Could not read stack outputs.")
+            sys.exit(1)
+    else:
+        # Create a temporary S3 bucket for the Lambda code
+        code_bucket = f"{account_id}-{stack_name}-lambda-code-{region}"
+        # Truncate if too long (S3 bucket names max 63 chars)
+        if len(code_bucket) > 63:
+            code_bucket = code_bucket[:63].rstrip("-")
+
+        with console.status(f"  Creating Lambda code bucket: {code_bucket}..."):
+            if region == "us-east-1":
+                create_ok, create_output = run_aws(
+                    ["s3api", "create-bucket", "--bucket", code_bucket],
+                    region=region,
+                )
+            else:
+                create_ok, create_output = run_aws(
+                    [
+                        "s3api",
+                        "create-bucket",
+                        "--bucket",
+                        code_bucket,
+                        "--create-bucket-configuration",
+                        f"LocationConstraint={region}",
+                    ],
+                    region=region,
+                )
+
+        if not create_ok:
+            if "BucketAlreadyOwnedByYou" in create_output:
+                console.print(
+                    f"  [green]✓[/green] Lambda code bucket exists: {code_bucket}"
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/red] Failed to create bucket: {create_output}"
+                )
+                sys.exit(1)
+        else:
+            console.print(f"  [green]✓[/green] Lambda code bucket: {code_bucket}")
+
+    with console.status("  Packaging and uploading Lambda code..."):
+        lambda_bucket, lambda_key = upload_lambda_code(code_bucket, stack_name, region)
+    console.print(
+        f"  [green]✓[/green] Lambda code uploaded: s3://{lambda_bucket}/{lambda_key}"
+    )
+
     # Build parameters
     params = [
         f"ParameterKey=AthenaWorkgroups,ParameterValue={workgroups}",
         f"ParameterKey=S3BucketsToMonitor,ParameterValue={s3_buckets}",
         f"ParameterKey=AnalysisIntervalMinutes,ParameterValue={interval}",
         f"ParameterKey=RetentionDays,ParameterValue={retention}",
+        f"ParameterKey=LambdaCodeBucket,ParameterValue={lambda_bucket}",
+        f"ParameterKey=LambdaCodeKey,ParameterValue={lambda_key}",
+        f"ParameterKey=AnalysisMode,ParameterValue={analysis_mode}",
     ]
     if ct_bucket:
         params.append(f"ParameterKey=CloudTrailBucket,ParameterValue={ct_bucket}")
     if kms_key:
         params.append(f"ParameterKey=KMSKeyArn,ParameterValue={kms_key}")
+    if monitored_account_ids:
+        params.append(
+            f"ParameterKey=MonitoredAccountIds,ParameterValue={monitored_account_ids}"
+        )
+    if external_id:
+        params.append(
+            f"ParameterKey=CrossAccountExternalId,ParameterValue={external_id}"
+        )
+    if multi_account_method and multi_account_method != "manual":
+        params.append(
+            f"ParameterKey=MultiAccountMethod,ParameterValue={multi_account_method}"
+        )
+    if org_id:
+        params.append(f"ParameterKey=OrganizationId,ParameterValue={org_id}")
+    if org_trail_bucket:
+        params.append(f"ParameterKey=OrgTrailBucket,ParameterValue={org_trail_bucket}")
 
     # Determine create vs update
     action = "update-stack" if is_update else "create-stack"
@@ -613,7 +1085,7 @@ def step_deploy(
 
     # Wait for completion
     with console.status(
-        f"  Waiting for stack to complete (this may take 2-3 minutes)..."
+        "  Waiting for stack to complete (this may take 2-3 minutes)..."
     ):
         wait_ok, wait_output = run_aws(
             [
@@ -680,9 +1152,16 @@ def step_deploy(
         for key, val in outputs.items():
             output_lines.append(f"  {key}: {val}")
 
+    if analysis_mode == "multi":
+        output_lines.append("")
+        output_lines.append(
+            f"  [green]✓[/green] Mode: Multi-account "
+            f"({len(analysis_config.get('account_ids', []))} accounts)"
+        )
+
     output_lines.append("")
     output_lines.append(f"  The analyser runs every {interval} minutes automatically.")
-    output_lines.append("  To run a historical analysis, see README Step 4.")
+    output_lines.append("  To run a historical analysis, see README Step 2.")
 
     console.print(
         Panel(
@@ -692,6 +1171,18 @@ def step_deploy(
             padding=(1, 2),
         )
     )
+
+    # Show cross-account role instructions after deployment
+    if analysis_mode == "multi":
+        if multi_account_method == "org" and analysis_config.get("want_enrichment"):
+            show_org_stacksets_instructions(account_id, stack_name, external_id, region)
+        elif multi_account_method != "org":
+            show_cross_account_instructions(
+                account_id,
+                stack_name,
+                external_id,
+                analysis_config.get("account_ids", []),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +1204,14 @@ def main():
     ctx = preflight_checks()
     region, trails = step_cloudtrail(ctx["default_region"])
     cloudtrail_bucket = step_s3_events(region, trails)
-    step_deploy(region, cloudtrail_bucket, ctx["template_path"], ctx["account_id"])
+    analysis_config = step_analysis_mode(ctx["account_id"], region)
+    step_deploy(
+        region,
+        cloudtrail_bucket,
+        ctx["template_path"],
+        ctx["account_id"],
+        analysis_config,
+    )
 
     console.print()
 
