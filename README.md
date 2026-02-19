@@ -59,17 +59,25 @@ The last three are available under "Customize advanced settings" during deployme
 
 ## Step 2: Analyse
 
-The interactive analysis script handles Lambda invocation, export download, and report generation:
+The analysis script handles Lambda invocation, export download, and report generation:
 
 ```bash
-python3 analyse.py
+python3 analyse_exports.py
 ```
 
-The script will walk you through:
+Running with no arguments starts **interactive mode**, which walks you through:
 
 1. **Find deployed stack** — auto-discovers the CloudFormation stack and reads its outputs (Lambda function name, S3 bucket)
 2. **Run analysis (optional)** — invoke the Lambda for historical data with a selectable time range (7/30/60/90 days or custom)
-3. **Download & generate report** — syncs exports from S3 and runs `analyse_exports.py` to produce an HTML report that opens in your browser
+3. **Download & generate report** — syncs exports from S3 and generates an HTML report that opens in your browser
+
+You can also run in **direct mode** by passing a local exports path:
+
+```bash
+python3 analyse_exports.py ./exports/                        # HTML report, auto-opens
+python3 analyse_exports.py ./exports/ --output report.txt    # Text report instead
+python3 analyse_exports.py ./exports/ --no-open              # HTML report, no auto-open
+```
 
 > **Note:** The Lambda also runs automatically every `AnalysisIntervalMinutes` (default: 10 minutes). You can skip the Lambda invocation step if you only want to download and report on existing data.
 

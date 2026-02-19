@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Athena Usage Analysis Script
+Athena Usage Analyser
 
 Analyzes exported zip files from the Athena Usage Analyser Lambda to produce
 meaningful insights and visualizations about customer Athena and S3 usage.
 
-By default, generates an HTML report and opens it in the browser.
+Modes:
+    Interactive (no args):  Finds the deployed stack, optionally invokes Lambda,
+                            downloads exports from S3, and generates the report.
+    Direct (with path):     Analyses a local exports folder or zip file directly.
 
 Usage:
-    python3 analyse_exports.py /path/to/exports/folder              # HTML report, auto-opens
-    python3 analyse_exports.py /path/to/exports/folder --no-open    # HTML report, no auto-open
+    python3 analyse_exports.py                                       # Interactive mode
+    python3 analyse_exports.py /path/to/exports/folder               # HTML report, auto-opens
+    python3 analyse_exports.py /path/to/exports/folder --no-open     # HTML report, no auto-open
     python3 analyse_exports.py /path/to/exports/folder --output report.txt  # Text report instead
 """
 
@@ -17,17 +21,18 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import zipfile
 import subprocess
 import webbrowser
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import io
 
 # Required packages for full functionality
-REQUIRED_PACKAGES = ["matplotlib"]
+REQUIRED_PACKAGES = ["matplotlib", "rich"]
 
 
 def install_dependencies():
@@ -66,6 +71,14 @@ matplotlib.use("Agg")  # Use non-interactive backend
 import matplotlib.pyplot as plt
 
 HAS_MATPLOTLIB = True
+
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class AthenaExportAnalyser:
@@ -2695,21 +2708,544 @@ class AthenaExportAnalyser:
         return html
 
 
+# ---------------------------------------------------------------------------
+# Interactive TUI helpers
+# ---------------------------------------------------------------------------
+
+console = Console()
+
+
+def _run_aws(args: List[str], region: Optional[str] = None) -> Tuple[bool, str]:
+    """Run an AWS CLI command. Returns (success, stdout_or_stderr)."""
+    cmd = ["aws"] + args
+    if region:
+        cmd += ["--region", region]
+    cmd += ["--output", "json", "--no-cli-pager"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return True, result.stdout.strip()
+    return False, result.stderr.strip()
+
+
+def _get_default_region() -> Optional[str]:
+    """Get the default region from AWS CLI config."""
+    result = subprocess.run(
+        ["aws", "configure", "get", "region"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return None
+
+
+def _get_stack_outputs(stack_name: str, region: str) -> Optional[Dict[str, str]]:
+    """Get CloudFormation stack outputs as a dict."""
+    ok, output = _run_aws(
+        ["cloudformation", "describe-stacks", "--stack-name", stack_name],
+        region=region,
+    )
+    if not ok:
+        return None
+    try:
+        stack = json.loads(output).get("Stacks", [{}])[0]
+        return {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return None
+
+
+def _show_stack_info(outputs: Dict[str, str]) -> None:
+    """Display key stack outputs."""
+    table = Table(box=box.ROUNDED, show_edge=True, pad_edge=True)
+    table.add_column("Resource", style="cyan")
+    table.add_column("Value", style="white")
+
+    if "LambdaFunctionName" in outputs:
+        table.add_row("Lambda Function", outputs["LambdaFunctionName"])
+    if "AnalysisBucketName" in outputs:
+        table.add_row("S3 Bucket", outputs["AnalysisBucketName"])
+    if "ExportsLocation" in outputs:
+        table.add_row("Exports Path", outputs["ExportsLocation"])
+
+    console.print()
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Interactive TUI steps
+# ---------------------------------------------------------------------------
+
+
+def _preflight_checks() -> Dict:
+    """Verify AWS CLI and credentials. Returns context dict."""
+    console.print()
+    console.print("[bold]Pre-flight Checks[/bold]")
+    console.print()
+
+    # 1. AWS CLI
+    with console.status("Checking AWS CLI..."):
+        result = subprocess.run(
+            ["aws", "--version"], capture_output=True, text=True
+        )
+    if result.returncode != 0:
+        console.print(
+            Panel(
+                "[red]AWS CLI is not installed.[/red]\n\n"
+                "Install it from: https://aws.amazon.com/cli/",
+                title="Error",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    version = result.stdout.strip().split()[0] if result.stdout else "unknown"
+    console.print(f"  [green]✓[/green] AWS CLI: {version}")
+
+    # 2. AWS credentials (with retry loop)
+    account_id = None
+    while True:
+        with console.status("Checking AWS credentials..."):
+            ok, output = _run_aws(["sts", "get-caller-identity"])
+        if ok:
+            identity = json.loads(output)
+            account_id = identity.get("Account", "unknown")
+            arn = identity.get("Arn", "")
+            console.print(f"  [green]✓[/green] Authenticated: {arn}")
+            console.print(f"  [green]✓[/green] Account: {account_id}")
+            break
+        else:
+            console.print()
+            console.print(
+                Panel(
+                    "[yellow]AWS credentials are not configured or have expired.[/yellow]\n\n"
+                    "Options:\n"
+                    "  • Run [bold]aws configure[/bold] to set up access keys\n"
+                    "  • Run [bold]aws sso login[/bold] if using SSO\n"
+                    "  • Set [bold]AWS_ACCESS_KEY_ID[/bold] and [bold]AWS_SECRET_ACCESS_KEY[/bold] environment variables",
+                    title="Authentication Required",
+                    border_style="yellow",
+                )
+            )
+            if not Confirm.ask("  Retry after authenticating?", default=True):
+                console.print("\n[dim]Cancelled.[/dim]")
+                sys.exit(0)
+
+    default_region = _get_default_region()
+
+    return {
+        "account_id": account_id,
+        "default_region": default_region,
+    }
+
+
+def _step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str, str]]:
+    """Find the deployed stack. Returns (region, stack_name, outputs)."""
+    console.print()
+    console.print("[bold]Step 1 · Find Deployed Stack[/bold]")
+    console.print()
+
+    region = Prompt.ask("  AWS Region", default=default_region or "us-east-1")
+
+    # Try default stack name first
+    default_stack = "athena-usage-analyser"
+
+    with console.status(f"  Looking for stack [cyan]{default_stack}[/cyan]..."):
+        outputs = _get_stack_outputs(default_stack, region)
+
+    if outputs:
+        console.print(f"  [green]✓[/green] Found stack: [bold]{default_stack}[/bold]")
+        _show_stack_info(outputs)
+        return region, default_stack, outputs
+
+    # Not found — list stacks and let user pick
+    console.print(f"  [dim]Stack '{default_stack}' not found. Searching...[/dim]")
+    console.print()
+
+    with console.status("  Listing CloudFormation stacks..."):
+        ok, output = _run_aws(
+            [
+                "cloudformation",
+                "list-stacks",
+                "--stack-status-filter",
+                "CREATE_COMPLETE",
+                "UPDATE_COMPLETE",
+            ],
+            region=region,
+        )
+
+    if not ok:
+        console.print(f"  [red]✗[/red] Failed to list stacks: {output}")
+        stack_name = Prompt.ask("  Enter stack name")
+        outputs = _get_stack_outputs(stack_name, region)
+        if not outputs:
+            console.print(
+                Panel(
+                    f"[red]Could not find stack '{stack_name}' in {region}.[/red]",
+                    title="Error",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+        return region, stack_name, outputs
+
+    stacks = json.loads(output).get("StackSummaries", [])
+    analyser_stacks = [
+        s for s in stacks if "athena" in s.get("StackName", "").lower()
+    ]
+
+    if not analyser_stacks:
+        console.print("  [yellow]![/yellow] No Athena-related stacks found.")
+        stack_name = Prompt.ask("  Enter stack name")
+        outputs = _get_stack_outputs(stack_name, region)
+        if not outputs:
+            console.print(
+                Panel(
+                    f"[red]Could not find stack '{stack_name}' in {region}.[/red]",
+                    title="Error",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+        return region, stack_name, outputs
+
+    if len(analyser_stacks) == 1:
+        stack_name = analyser_stacks[0]["StackName"]
+        console.print(f"  [green]✓[/green] Found stack: [bold]{stack_name}[/bold]")
+    else:
+        for i, s in enumerate(analyser_stacks, 1):
+            console.print(f"  [bold]{i}[/bold]. {s['StackName']}")
+        console.print()
+        while True:
+            choice_str = Prompt.ask(
+                f"  Select stack (1-{len(analyser_stacks)})", default="1"
+            )
+            try:
+                idx = int(choice_str)
+                if 1 <= idx <= len(analyser_stacks):
+                    stack_name = analyser_stacks[idx - 1]["StackName"]
+                    break
+            except ValueError:
+                pass
+            console.print(f"  [red]✗[/red] Enter a number between 1 and {len(analyser_stacks)}.")
+
+    outputs = _get_stack_outputs(stack_name, region)
+    if not outputs:
+        console.print(
+            Panel(
+                f"[red]Could not read outputs for stack '{stack_name}'.[/red]",
+                title="Error",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    _show_stack_info(outputs)
+    return region, stack_name, outputs
+
+
+def _step_invoke_lambda(region: str, outputs: Dict[str, str]) -> None:
+    """Optionally invoke Lambda for historical analysis."""
+    console.print()
+    console.print("[bold]Step 2 · Run Analysis (Optional)[/bold]")
+    console.print()
+    console.print(
+        "  The Lambda collects data automatically on a schedule.\n"
+        "  You can also invoke it now to capture historical data (up to 90 days)."
+    )
+    console.print()
+
+    if not Confirm.ask("  Invoke Lambda for historical analysis?", default=True):
+        console.print("\n  [dim]Skipped — will use existing exports.[/dim]")
+        return
+
+    # Time range
+    console.print()
+    console.print("  How far back should the analysis go?")
+    console.print()
+    console.print("  [bold]1[/bold]. Last 1 day")
+    console.print("  [bold]2[/bold]. Last 7 days")
+    console.print("  [bold]3[/bold]. Last 14 days")
+    console.print("  [bold]4[/bold]. Last 30 days")
+    console.print("  [bold]5[/bold]. Last 60 days")
+    console.print("  [bold]6[/bold]. Last 90 days (maximum)")
+    console.print("  [bold]7[/bold]. Custom date range")
+    console.print()
+
+    while True:
+        choice = Prompt.ask("  Select time range (1-7)", default="4")
+        if choice in ("1", "2", "3", "4", "5", "6", "7"):
+            break
+        console.print("  [red]✗[/red] Enter a number between 1 and 7.")
+
+    now = datetime.now(timezone.utc)
+
+    if choice == "7":
+        while True:
+            start_str = Prompt.ask("  Start date (YYYY-MM-DD)")
+            try:
+                start_date = datetime.strptime(start_str, "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+                break
+            except ValueError:
+                console.print("  [red]✗[/red] Use format YYYY-MM-DD.")
+
+        while True:
+            end_str = Prompt.ask(
+                "  End date (YYYY-MM-DD)", default=now.strftime("%Y-%m-%d")
+            )
+            try:
+                end_date = datetime.strptime(end_str, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, tzinfo=timezone.utc
+                )
+                if end_date >= start_date:
+                    break
+                console.print("  [red]✗[/red] End date must be after start date.")
+            except ValueError:
+                console.print("  [red]✗[/red] Use format YYYY-MM-DD.")
+
+        start_time = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_time = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        days_map = {"1": 1, "2": 7, "3": 14, "4": 30, "5": 60, "6": 90}
+        days = days_map[choice]
+        start_time = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    function_name = outputs.get("LambdaFunctionName", "athena-usage-analyser-analyser")
+    payload = json.dumps({"start_time": start_time, "end_time": end_time})
+
+    console.print()
+    console.print(f"  Time range: {start_time} → {end_time}")
+    console.print(f"  Function:   {function_name}")
+
+    # Invoke
+    console.print()
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        output_file = tmp.name
+
+    with console.status("  Invoking Lambda (this may take a few minutes)..."):
+        ok, output = _run_aws(
+            [
+                "lambda",
+                "invoke",
+                "--function-name",
+                function_name,
+                "--payload",
+                payload,
+                "--cli-binary-format",
+                "raw-in-base64-out",
+                output_file,
+            ],
+            region=region,
+        )
+
+    if not ok:
+        console.print(
+            Panel(
+                f"[red]Lambda invocation failed.[/red]\n\n{output}",
+                title="Error",
+                border_style="red",
+            )
+        )
+        if not Confirm.ask("  Continue to download existing exports?", default=True):
+            console.print("\n[dim]Cancelled.[/dim]")
+            sys.exit(0)
+        return
+
+    # Check response
+    try:
+        invoke_result = json.loads(output)
+        status_code = invoke_result.get("StatusCode", 0)
+        function_error = invoke_result.get("FunctionError", "")
+    except json.JSONDecodeError:
+        status_code = 0
+        function_error = ""
+
+    if function_error:
+        try:
+            error_payload = Path(output_file).read_text()
+            console.print(f"  [red]✗[/red] Lambda returned an error: {error_payload[:500]}")
+        except Exception:
+            console.print(f"  [red]✗[/red] Lambda returned error: {function_error}")
+        if not Confirm.ask("  Continue to download existing exports?", default=True):
+            console.print("\n[dim]Cancelled.[/dim]")
+            sys.exit(0)
+    elif status_code == 200:
+        console.print("  [green]✓[/green] Lambda invocation successful")
+        try:
+            result_data = json.loads(Path(output_file).read_text())
+            if isinstance(result_data, dict) and result_data.get("statusCode") == 200:
+                body = result_data.get("body", "")
+                if isinstance(body, str):
+                    try:
+                        body = json.loads(body)
+                    except json.JSONDecodeError:
+                        pass
+                if isinstance(body, dict):
+                    export_path = body.get("export_path", "")
+                    if export_path:
+                        console.print(f"  [green]✓[/green] Export: {export_path}")
+        except Exception:
+            pass
+    else:
+        console.print(f"  [green]✓[/green] Lambda invocation completed (status: {status_code})")
+
+    # Clean up temp file
+    try:
+        Path(output_file).unlink()
+    except Exception:
+        pass
+
+
+def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
+    """Download exports from S3, analyse, and generate HTML report."""
+    console.print()
+    console.print("[bold]Step 3 · Download & Generate Report[/bold]")
+    console.print()
+
+    bucket_name = outputs.get("AnalysisBucketName", "")
+    exports_s3_path = outputs.get("ExportsLocation", f"s3://{bucket_name}/exports/")
+
+    if not bucket_name and not exports_s3_path:
+        console.print("  [red]✗[/red] Could not determine S3 bucket from stack outputs.")
+        exports_s3_path = Prompt.ask("  Enter S3 exports path (e.g. s3://bucket/exports/)")
+
+    # Local download directory
+    default_dir = str(SCRIPT_DIR / "exports")
+    exports_dir = Prompt.ask("  Local exports directory", default=default_dir)
+    exports_path = Path(exports_dir)
+
+    # Download
+    console.print()
+    with console.status(f"  Downloading exports from {exports_s3_path}..."):
+        ok, output = _run_aws(
+            ["s3", "sync", "--size-only", exports_s3_path, str(exports_path)],
+            region=region,
+        )
+
+    if not ok:
+        console.print(
+            Panel(
+                f"[red]Failed to download exports.[/red]\n\n{output}",
+                title="Error",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    # Count downloaded files
+    zip_files = list(exports_path.rglob("*.zip"))
+    if not zip_files:
+        console.print(
+            Panel(
+                "[yellow]No export files found.[/yellow]\n\n"
+                "The Lambda may not have run yet, or exports may be in a different location.\n"
+                f"Checked: {exports_path}",
+                title="No Data",
+                border_style="yellow",
+            )
+        )
+        sys.exit(0)
+
+    console.print(f"  [green]✓[/green] Downloaded {len(zip_files)} export{'s' if len(zip_files) != 1 else ''}")
+
+    # Analyse directly
+    console.print()
+    console.print("  Generating HTML report...")
+    console.print()
+
+    report_name = "athena-usage-report.html"
+    report_path = SCRIPT_DIR / report_name
+
+    analyser = AthenaExportAnalyser(str(exports_path))
+    file_count = analyser.load_exports()
+
+    if file_count == 0:
+        console.print(
+            Panel(
+                "[yellow]No data found in export files.[/yellow]",
+                title="No Data",
+                border_style="yellow",
+            )
+        )
+        sys.exit(0)
+
+    analyser.generate_html_report(str(report_path))
+    console.print(f"  [green]✓[/green] Report generated: {report_path}")
+
+    # Auto-open
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(report_path)], check=True)
+        elif sys.platform == "win32":
+            os.startfile(str(report_path))
+        else:
+            webbrowser.open(f"file://{report_path}")
+    except Exception:
+        pass
+
+    # Success panel
+    console.print()
+    console.print(
+        Panel(
+            f"  [green]✓[/green] Exports:  {exports_path} ({len(zip_files)} files)\n"
+            f"  [green]✓[/green] Report:   {report_path}\n"
+            f"\n"
+            f"  The report should open in your browser automatically.\n"
+            f"  If not, open [bold]{report_name}[/bold] manually.",
+            title="[green]Analysis Complete[/green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+
+
+def _interactive_mode() -> None:
+    """Run the full interactive TUI: find stack, invoke Lambda, download, report."""
+    console.print()
+    console.print(
+        Panel(
+            "[bold]Athena Usage Analyser[/bold]\n"
+            "[dim]Invoke Lambda, download exports, and generate report[/dim]",
+            box=box.ROUNDED,
+            padding=(1, 4),
+        )
+    )
+
+    ctx = _preflight_checks()
+    region, stack_name, outputs = _step_find_stack(ctx["default_region"])
+    _step_invoke_lambda(region, outputs)
+    _step_download_and_report(region, outputs)
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze Athena usage exports and generate reports",
+        description="Athena Usage Analyser — analyse exports and generate reports",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Modes:
+  Interactive (default):  Finds the deployed stack, invokes Lambda,
+                          downloads exports, and generates a report.
+  Direct (with path):     Analyses a local exports folder directly.
+
 Examples:
-  python3 analyse_exports.py ./exports/
-  python3 analyse_exports.py ./exports/ --output report.txt
-  python3 analyse_exports.py ./exports/ --html report.html
-  python3 analyse_exports.py ./exports/ --graphs ./graphs/
-  python3 analyse_exports.py ./exports/ --no-open
+  python3 analyse_exports.py                                   # Interactive mode
+  python3 analyse_exports.py ./exports/                        # Direct — HTML report
+  python3 analyse_exports.py ./exports/ --output report.txt    # Direct — text report
+  python3 analyse_exports.py ./exports/ --html report.html     # Direct — custom HTML path
+  python3 analyse_exports.py ./exports/ --graphs ./graphs/     # Direct — save graphs
+  python3 analyse_exports.py ./exports/ --no-open              # Direct — no auto-open
         """,
     )
     parser.add_argument(
-        "exports_path", help="Path to exports folder or single zip file"
+        "exports_path", nargs="?", default=None,
+        help="Path to exports folder or single zip file (omit for interactive mode)",
     )
     parser.add_argument(
         "--output", "-o", help="Output path for text report (instead of HTML)"
@@ -2727,13 +3263,17 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate path
+    # No path given → interactive mode
+    if args.exports_path is None:
+        _interactive_mode()
+        return
+
+    # Direct mode — analyse a local path
     exports_path = Path(args.exports_path)
     if not exports_path.exists():
         print(f"Error: Path does not exist: {exports_path}")
         sys.exit(1)
 
-    # Create analyser and load data
     analyser = AthenaExportAnalyser(str(exports_path))
     file_count = analyser.load_exports()
 
@@ -2741,31 +3281,25 @@ Examples:
         print("No export files found to analyze.")
         sys.exit(1)
 
-    # Determine output mode
     html_path = None
 
     if args.output:
-        # Text report mode (explicitly requested)
         report = analyser.generate_report(args.output)
         if not args.quiet:
             print("\n" + report)
     else:
-        # HTML report mode (default)
         if args.html:
             html_path = args.html
         else:
-            # Auto-generate HTML filename
             timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             html_path = f"athena-usage-report-{timestamp}.html"
 
         analyser.generate_html_report(html_path)
 
-        # Auto-open the HTML file
         if not args.no_open:
             abs_path = os.path.abspath(html_path)
             print(f"Opening report in browser: {abs_path}")
             try:
-                # Use 'open' on macOS for better browser handling
                 if sys.platform == "darwin":
                     subprocess.run(["open", abs_path], check=True)
                 elif sys.platform == "win32":
@@ -2776,7 +3310,6 @@ Examples:
                 print(f"Could not auto-open file: {e}")
                 print(f"Please open manually: {abs_path}")
 
-    # Generate graphs if requested
     if args.graphs:
         analyser.generate_graphs(args.graphs)
 
@@ -2784,4 +3317,8 @@ Examples:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n\n[dim]Cancelled.[/dim]\n")
+        sys.exit(0)
