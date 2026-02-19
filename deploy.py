@@ -251,8 +251,8 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
 # ---------------------------------------------------------------------------
 
 
-def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
-    """Optionally enable S3 data events. Returns CloudTrail bucket name or None."""
+def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Optional[str]]:
+    """Optionally enable S3 data events. Returns (CloudTrail bucket, monitored S3 buckets CSV) or (None, None)."""
     console.print()
     console.print("[bold]Step 2 · S3 Data Events (Optional)[/bold]")
     console.print()
@@ -266,7 +266,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
         console.print(
             "\n  [dim]Skipped — S3 bucket monitoring will not be available.[/dim]"
         )
-        return None
+        return None, None
 
     # Pick trail from discovered trails
     trail_names = [t.get("Name", "") for t in trails if t.get("Name")]
@@ -274,7 +274,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
     if not trail_names:
         console.print("  [red]✗[/red] No trails available to configure.")
         console.print("  [dim]Skipping S3 data events.[/dim]")
-        return None
+        return None, None
 
     if len(trail_names) == 1:
         trail_name = trail_names[0]
@@ -345,7 +345,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
 
     if not bucket_names:
         console.print("  [red]✗[/red] No buckets provided. Skipping S3 data events.")
-        return None
+        return None, None
 
     # Build data resource ARNs
     data_resources = [f"arn:aws:s3:::{b}/" for b in bucket_names]
@@ -379,7 +379,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
     if not ok:
         console.print(f"  [red]✗[/red] Failed to enable S3 data events: {output}")
         if Confirm.ask("  Continue without S3 monitoring?", default=True):
-            return None
+            return None, None
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
 
@@ -412,7 +412,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
     if cloudtrail_bucket:
         console.print(f"  [green]✓[/green] CloudTrail logs bucket: {cloudtrail_bucket}")
 
-    return cloudtrail_bucket
+    return cloudtrail_bucket, ",".join(bucket_names)
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +755,7 @@ def step_deploy(
     template_path: Path,
     account_id: str,
     analysis_config: Optional[Dict] = None,
+    monitored_s3_buckets: Optional[str] = None,
 ) -> None:
     """Collect parameters, deploy stack, wait, show results."""
     if analysis_config is None:
@@ -784,10 +785,11 @@ def step_deploy(
         default="*",
     )
 
-    # S3 buckets to monitor
+    # S3 buckets to monitor (use selection from Step 2 if available)
+    s3_default = monitored_s3_buckets if monitored_s3_buckets else "*"
     s3_buckets = Prompt.ask(
         "  S3 Buckets to monitor [dim](comma-separated or \\* for auto-detect)[/dim]",
-        default="*",
+        default=s3_default,
     )
 
     # Defaults for advanced settings
@@ -1206,7 +1208,7 @@ def main():
 
     ctx = preflight_checks()
     region, trails = step_cloudtrail(ctx["default_region"])
-    cloudtrail_bucket = step_s3_events(region, trails)
+    cloudtrail_bucket, monitored_s3_buckets = step_s3_events(region, trails)
     analysis_config = step_analysis_mode(ctx["account_id"], region)
     step_deploy(
         region,
@@ -1214,6 +1216,7 @@ def main():
         ctx["template_path"],
         ctx["account_id"],
         analysis_config,
+        monitored_s3_buckets,
     )
 
     console.print()
