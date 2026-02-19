@@ -79,24 +79,20 @@ For advanced usage and output options, see [ANALYSIS.md](ANALYSIS.md).
 
 ## Step 3: Cleanup
 
-**3.1** Empty the S3 bucket:
+The interactive cleanup script removes all deployed resources:
+
 ```bash
-aws s3 rm s3://athena-usage-analyser-analysis-<ACCOUNT_ID> --recursive
+python3 cleanup.py
 ```
 
-**3.2** Delete the CloudFormation stack:
-```bash
-aws cloudformation delete-stack \
-  --stack-name athena-usage-analyser \
-  --region <REGION>
-```
+The script will walk you through:
 
-**3.3** (Optional) Delete the retained S3 bucket manually if needed:
-```bash
-aws s3 rb s3://athena-usage-analyser-analysis-<ACCOUNT_ID>
-```
-
-> **Note:** The S3 bucket has a `Retain` policy and must be deleted manually after stack removal.
+1. **Find deployed stack** — auto-discovers the CloudFormation stack
+2. **Cleanup** — with a confirmation prompt, then:
+   - Empties the S3 analysis bucket
+   - Deletes the CloudFormation stack and waits for completion
+   - Optionally deletes the retained S3 bucket (has a Retain policy)
+   - Optionally deletes local exports and generated reports
 
 ---
 
