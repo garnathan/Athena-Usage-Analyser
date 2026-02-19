@@ -19,19 +19,19 @@ All three scripts are interactive and guide you through each step. Requires the 
 - S3 bucket access patterns
 - Migration readiness: query complexity, DDL tracking, long-running queries, concurrency, partition usage, SQL compatibility flags, and a 0-100 readiness score
 
-## Analysis Modes
+## Deployment Modes
 
-### Single Account (default)
+### 1. Single Account (default)
 
 Analyses Athena usage in the account where the stack is deployed.
 
-### Multi-Account (manual)
+### 2. Multi-Account (manual)
 
 Analyses multiple AWS accounts via explicit account IDs and cross-account AssumeRole. The deploy script collects account IDs, generates an ExternalId, and shows commands to deploy a read-only IAM role in each monitored account.
 
 The cross-account role grants read-only access to `cloudtrail:LookupEvents` and `athena:BatchGetQueryExecution`.
 
-### AWS Organizations
+### 3. AWS Organizations
 
 The simplest multi-account setup for customers using AWS Organizations:
 
