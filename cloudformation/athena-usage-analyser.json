@@ -717,7 +717,6 @@
         },
         "Timeout": 900,
         "MemorySize": 1024,
-        "ReservedConcurrentExecutions": 1,
         "Environment": {
           "Variables": {
             "OUTPUT_BUCKET": {
