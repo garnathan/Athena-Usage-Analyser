@@ -1021,36 +1021,31 @@ def step_deploy(
         f"  [green]✓[/green] Lambda code uploaded: s3://{lambda_bucket}/{lambda_key}"
     )
 
-    # Build parameters
-    params = [
-        f"ParameterKey=AthenaWorkgroups,ParameterValue={workgroups}",
-        f"ParameterKey=S3BucketsToMonitor,ParameterValue={s3_buckets}",
-        f"ParameterKey=AnalysisIntervalMinutes,ParameterValue={interval}",
-        f"ParameterKey=RetentionDays,ParameterValue={retention}",
-        f"ParameterKey=LambdaCodeBucket,ParameterValue={lambda_bucket}",
-        f"ParameterKey=LambdaCodeKey,ParameterValue={lambda_key}",
-        f"ParameterKey=AnalysisMode,ParameterValue={analysis_mode}",
+    # Build parameters as JSON (supports commas in values)
+    params_list = [
+        {"ParameterKey": "AthenaWorkgroups", "ParameterValue": workgroups},
+        {"ParameterKey": "S3BucketsToMonitor", "ParameterValue": s3_buckets},
+        {"ParameterKey": "AnalysisIntervalMinutes", "ParameterValue": str(interval)},
+        {"ParameterKey": "RetentionDays", "ParameterValue": str(retention)},
+        {"ParameterKey": "LambdaCodeBucket", "ParameterValue": lambda_bucket},
+        {"ParameterKey": "LambdaCodeKey", "ParameterValue": lambda_key},
+        {"ParameterKey": "AnalysisMode", "ParameterValue": analysis_mode},
     ]
     if ct_bucket:
-        params.append(f"ParameterKey=CloudTrailBucket,ParameterValue={ct_bucket}")
+        params_list.append({"ParameterKey": "CloudTrailBucket", "ParameterValue": ct_bucket})
     if kms_key:
-        params.append(f"ParameterKey=KMSKeyArn,ParameterValue={kms_key}")
+        params_list.append({"ParameterKey": "KMSKeyArn", "ParameterValue": kms_key})
     if monitored_account_ids:
-        params.append(
-            f"ParameterKey=MonitoredAccountIds,ParameterValue={monitored_account_ids}"
-        )
+        params_list.append({"ParameterKey": "MonitoredAccountIds", "ParameterValue": monitored_account_ids})
     if external_id:
-        params.append(
-            f"ParameterKey=CrossAccountExternalId,ParameterValue={external_id}"
-        )
+        params_list.append({"ParameterKey": "CrossAccountExternalId", "ParameterValue": external_id})
     if multi_account_method and multi_account_method != "manual":
-        params.append(
-            f"ParameterKey=MultiAccountMethod,ParameterValue={multi_account_method}"
-        )
+        params_list.append({"ParameterKey": "MultiAccountMethod", "ParameterValue": multi_account_method})
     if org_id:
-        params.append(f"ParameterKey=OrganizationId,ParameterValue={org_id}")
+        params_list.append({"ParameterKey": "OrganizationId", "ParameterValue": org_id})
     if org_trail_bucket:
-        params.append(f"ParameterKey=OrgTrailBucket,ParameterValue={org_trail_bucket}")
+        params_list.append({"ParameterKey": "OrgTrailBucket", "ParameterValue": org_trail_bucket})
+    params = [json.dumps(params_list)]
 
     # Determine create vs update
     action = "update-stack" if is_update else "create-stack"
