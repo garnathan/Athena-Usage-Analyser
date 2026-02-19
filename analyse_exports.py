@@ -24,6 +24,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Ensure sibling modules are importable regardless of working directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from _helpers import install_dependencies, run_aws, get_default_region
 
 install_dependencies(["matplotlib", "rich"])
