@@ -426,10 +426,10 @@ def step_analysis_mode(account_id: str, region: str) -> Dict:
     console.print("[bold]Step 3 · Analysis Mode[/bold]")
     console.print()
     console.print(
-        "  [bold]1[/bold]. Single account     [dim](analyse this account only)[/dim]"
+        "  [bold]1[/bold]. Single AWS account    [dim](analyse this account only)[/dim]"
     )
     console.print(
-        "  [bold]2[/bold]. Multi-account       [dim](analyse multiple AWS accounts via explicit IDs)[/dim]"
+        "  [bold]2[/bold]. Multiple AWS accounts [dim](analyse multiple accounts via explicit IDs)[/dim]"
     )
     console.print(
         "  [bold]3[/bold]. AWS Organizations   [dim](auto-discover accounts, use org trail)[/dim]"
