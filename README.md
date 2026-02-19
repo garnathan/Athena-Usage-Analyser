@@ -69,6 +69,27 @@ The analysis script downloads these and generates an HTML report that opens in y
 
 ## Security
 
-- All public access blocked on S3, SSL/TLS enforced, server-side encryption (AES-256 or KMS)
-- IAM policies follow least-privilege
-- Cross-account roles are read-only with ExternalId trust validation
+**S3 Bucket**
+- All public access blocked (`PublicAccessBlockConfiguration` on all four settings)
+- `BucketOwnerEnforced` ownership controls (ACLs disabled)
+- TLS 1.2 minimum enforced via bucket policy
+- Server-side encryption (AES-256 default, optional KMS via `KMSKeyArn` parameter)
+- Versioning enabled with noncurrent version expiry (30 days)
+
+**Lambda**
+- Reserved concurrency set to 1 (prevents duplicate concurrent runs)
+- Optional KMS encryption for environment variables
+- Input validation: time range capped at 90 days, type-checked, ordering enforced
+- CloudTrail file size limit (50 MB) to prevent memory exhaustion from oversized files
+- Generic error responses — no stack traces or internal details leaked to callers
+- Query sanitization: SQL comments stripped, string/numeric literals masked, output truncated to 1000 chars
+- CSV injection prevention: workgroup names quoted in exported CSV files
+- SHA-256 hashing for query pattern fingerprinting
+- Bucket default encryption respected (no hardcoded `ServerSideEncryption`)
+- Event deduplication by CloudTrail `eventID` to prevent double-counting
+
+**IAM**
+- Least-privilege policies scoped to specific resources where possible
+- Cross-account roles are read-only (`cloudtrail:LookupEvents`, `athena:BatchGetQueryExecution`) with ExternalId trust validation
+- Organizations discovery limited to `organizations:ListAccounts` and `organizations:DescribeOrganization`
+- Org trail bucket access scoped to `AWSLogs/*` prefix only
