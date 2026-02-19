@@ -57,83 +57,41 @@ The last three are available under "Customize advanced settings" during deployme
 
 ---
 
-## Step 2: Run Analysis
+## Step 2: Analyse
 
-### Automatic Collection (Future Data)
+The interactive analysis script handles Lambda invocation, export download, and report generation:
 
-Once deployed, the Lambda runs automatically every `AnalysisIntervalMinutes` (default: 10 minutes) to continuously collect Athena usage data. No manual action is required for ongoing monitoring.
-
-### Manual Invocation (Historical Data)
-
-You can also invoke the Lambda manually to collect historical data. This is useful for:
-- Initial deployment to capture past activity
-- One-time analysis of a specific time period
-
-> **Important:** Historical analysis only works for time periods when CloudTrail was already configured. If you just enabled S3 data events, you can only retrieve historical data from that point forward.
-
-**2.1** Run analysis for the last 60 days (example):
 ```bash
-# Calculate dates for the last 60 days
-END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-START_TIME=$(date -u -v-60d +"%Y-%m-%dT%H:%M:%SZ")  # macOS
-# START_TIME=$(date -u -d "60 days ago" +"%Y-%m-%dT%H:%M:%SZ")  # Linux
-
-aws lambda invoke \
-  --function-name athena-usage-analyser-analyser \
-  --payload "{\"start_time\": \"$START_TIME\", \"end_time\": \"$END_TIME\"}" \
-  --cli-binary-format raw-in-base64-out \
-  --region <REGION> \
-  output.json && cat output.json
+python3 analyse.py
 ```
 
-> **Note:** The maximum lookback is 90 days (CloudTrail API limit). S3 data events are only available if CloudTrail S3 logging was enabled during that period.
+The script will walk you through:
 
-**2.2** Run analysis for a specific time range:
-```bash
-aws lambda invoke \
-  --function-name athena-usage-analyser-analyser \
-  --payload '{"start_time": "2024-01-01T00:00:00Z", "end_time": "2024-01-31T23:59:59Z"}' \
-  --cli-binary-format raw-in-base64-out \
-  --region <REGION> \
-  output.json && cat output.json
-```
+1. **Find deployed stack** — auto-discovers the CloudFormation stack and reads its outputs (Lambda function name, S3 bucket)
+2. **Run analysis (optional)** — invoke the Lambda for historical data with a selectable time range (7/30/60/90 days or custom)
+3. **Download & generate report** — syncs exports from S3 and runs `analyse_exports.py` to produce an HTML report that opens in your browser
+
+> **Note:** The Lambda also runs automatically every `AnalysisIntervalMinutes` (default: 10 minutes). You can skip the Lambda invocation step if you only want to download and report on existing data.
+
+For advanced usage and output options, see [ANALYSIS.md](ANALYSIS.md).
 
 ---
 
-## Step 3: Retrieve Results
+## Step 3: Cleanup
 
-**3.1** List available exports:
-```bash
-aws s3 ls s3://athena-usage-analyser-analysis-<ACCOUNT_ID>/exports/ --recursive
-```
-
-**3.2** Download all exports:
-```bash
-aws s3 sync s3://athena-usage-analyser-analysis-<ACCOUNT_ID>/exports/ ./exports/
-```
-
-**3.3** Generate analysis report (see [ANALYSIS.md](ANALYSIS.md) for details):
-```bash
-python3 analyse_exports.py ./exports/
-```
-
----
-
-## Step 4: Cleanup
-
-**4.1** Empty the S3 bucket:
+**3.1** Empty the S3 bucket:
 ```bash
 aws s3 rm s3://athena-usage-analyser-analysis-<ACCOUNT_ID> --recursive
 ```
 
-**4.2** Delete the CloudFormation stack:
+**3.2** Delete the CloudFormation stack:
 ```bash
 aws cloudformation delete-stack \
   --stack-name athena-usage-analyser \
   --region <REGION>
 ```
 
-**4.3** (Optional) Delete the retained S3 bucket manually if needed:
+**3.3** (Optional) Delete the retained S3 bucket manually if needed:
 ```bash
 aws s3 rb s3://athena-usage-analyser-analysis-<ACCOUNT_ID>
 ```
