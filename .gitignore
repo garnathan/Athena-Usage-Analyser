@@ -28,7 +28,7 @@ ENV/
 *.zip
 
 # Generated reports
-athena-usage-report-*.html
+*.html
 report
 
 # Downloaded exports

@@ -81,8 +81,6 @@ python3 analyse_exports.py ./exports/ --no-open              # HTML report, no a
 
 > **Note:** The Lambda also runs automatically every `AnalysisIntervalMinutes` (default: 10 minutes). You can skip the Lambda invocation step if you only want to download and report on existing data.
 
-For advanced usage and output options, see [ANALYSIS.md](ANALYSIS.md).
-
 ---
 
 ## Step 3: Cleanup
