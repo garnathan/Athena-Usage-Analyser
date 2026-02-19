@@ -457,11 +457,36 @@ def step_analysis_mode(account_id: str, region: str) -> Dict:
     console.print()
 
     # Collect account IDs
+    console.print(
+        "  [bold]1[/bold]. Enter account IDs manually\n"
+        "  [bold]2[/bold]. Load from a file [dim](one account ID per line)[/dim]"
+    )
+    console.print()
+    input_method = Prompt.ask("  How to provide account IDs?", choices=["1", "2"], default="1")
+
     while True:
-        accounts_input = Prompt.ask(
-            "  AWS account IDs to analyse [dim](comma-separated, 12-digit IDs)[/dim]"
-        )
-        account_ids = [a.strip() for a in accounts_input.split(",") if a.strip()]
+        if input_method == "2":
+            file_path = Prompt.ask("  Path to account IDs file")
+            try:
+                with open(file_path.strip()) as f:
+                    lines = f.read().splitlines()
+                # Strip whitespace and skip empty lines / comments
+                account_ids = [
+                    line.strip() for line in lines
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            except FileNotFoundError:
+                console.print(f"  [red]✗[/red] File not found: {file_path}")
+                continue
+            except Exception as e:
+                console.print(f"  [red]✗[/red] Could not read file: {e}")
+                continue
+        else:
+            accounts_input = Prompt.ask(
+                "  AWS account IDs [dim](comma-separated, 12-digit IDs)[/dim]"
+            )
+            account_ids = [a.strip() for a in accounts_input.split(",") if a.strip()]
+
         if not account_ids:
             console.print("  [red]✗[/red] At least one account ID is required.")
             continue
