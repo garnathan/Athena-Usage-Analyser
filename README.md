@@ -23,106 +23,41 @@ A CloudFormation-deployed Lambda that captures Amazon Athena usage via CloudTrai
 
 ---
 
-## Step 1: Verify CloudTrail is Enabled
+## Step 1: Deploy
 
-Athena API calls are logged as **management events** in CloudTrail, which are enabled by default.
+The interactive deploy script handles everything — CloudTrail verification, optional S3 data event setup, and CloudFormation stack deployment:
 
-**1.1** Verify CloudTrail is enabled in your region:
 ```bash
-aws cloudtrail describe-trails --region <REGION>
+python3 deploy.py
 ```
 
-You should see at least one trail. Note the `Name` field for use in Step 2.
+The script will walk you through:
 
----
+1. **Pre-flight checks** — verifies AWS CLI, credentials, and the CloudFormation template
+2. **Region & CloudTrail** — asks for your AWS region and verifies CloudTrail is active
+3. **S3 Data Events (optional)** — offers to enable S3 data events for bucket-level access monitoring. If enabled, you select a CloudTrail trail and pick S3 buckets from your account
+4. **Configure & Deploy** — collects stack parameters (with sensible defaults), shows a summary, and deploys the CloudFormation stack
 
-## Step 2: Enable S3 Data Events (Required for S3 Monitoring)
-
-To capture S3 bucket access patterns (GetObject, PutObject, etc.), you must:
-1. Enable **S3 data events** in CloudTrail (these are NOT enabled by default)
-2. Set the **CloudTrailBucket** parameter when deploying (required because S3 data events are only available via CloudTrail log files, not the CloudTrail API)
-
-**2.1** Enable S3 data events for your data lake buckets:
-```bash
-aws cloudtrail put-event-selectors \
-  --trail-name <TRAIL_NAME> \
-  --event-selectors '[{
-    "ReadWriteType": "All",
-    "IncludeManagementEvents": true,
-    "DataResources": [{
-      "Type": "AWS::S3::Object",
-      "Values": [
-        "arn:aws:s3:::<BUCKET_1>/",
-        "arn:aws:s3:::<BUCKET_2>/",
-        "arn:aws:s3:::<BUCKET_3>/"
-      ]
-    }]
-  }]' \
-  --region <REGION>
-```
-
-**2.2** Verify S3 data events are enabled:
-```bash
-aws cloudtrail get-event-selectors --trail-name <TRAIL_NAME> --region <REGION>
-```
-
-**2.3** Find your CloudTrail S3 bucket name (needed for Step 3):
-```bash
-aws cloudtrail describe-trails --region <REGION> --query 'trailList[].S3BucketName'
-```
-
-> **Note:** S3 data events have a ~15-20 minute delay when first enabled. After that, CloudTrail delivers logs to S3 every 5-15 minutes. S3 data events incur additional CloudTrail charges.
-
----
-
-## Step 3: Deploy the CloudFormation Stack
-
-**3.1** Deploy with default settings:
-```bash
-aws cloudformation create-stack \
-  --stack-name athena-usage-analyser \
-  --template-body file://cloudformation/athena-usage-analyser.json \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region <REGION>
-```
-
-**3.2** (Optional) Deploy with custom parameters:
-```bash
-aws cloudformation create-stack \
-  --stack-name athena-usage-analyser \
-  --template-body file://cloudformation/athena-usage-analyser.json \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --parameters \
-    ParameterKey=AthenaWorkgroups,ParameterValue="primary,analytics" \
-    ParameterKey=S3BucketsToMonitor,ParameterValue="my-datalake-raw,my-datalake-processed" \
-    ParameterKey=CloudTrailBucket,ParameterValue="my-cloudtrail-bucket" \
-    ParameterKey=RetentionDays,ParameterValue=180 \
-  --region <REGION>
-```
-
-**3.3** Wait for stack creation to complete:
-```bash
-aws cloudformation wait stack-create-complete \
-  --stack-name athena-usage-analyser \
-  --region <REGION>
-```
+> **Note:** The script requires the AWS CLI to be installed and configured. If credentials are missing or expired, it will prompt you to authenticate and retry.
 
 ### Available Parameters
 
-All parameters are optional. Defaults work for most use cases.
+The deploy script asks for these interactively. All have sensible defaults.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `AthenaWorkgroups` | `*` | Workgroups to monitor (comma-separated, or `*` for all) |
 | `S3BucketsToMonitor` | `*` | S3 buckets to track (`*` auto-detects Athena-related buckets) |
-| `CloudTrailBucket` | *(empty)* | **Required for S3 monitoring.** CloudTrail S3 bucket where logs are stored |
+| `CloudTrailBucket` | *(auto-detected)* | **Required for S3 monitoring.** CloudTrail S3 bucket where logs are stored |
 | `AnalysisIntervalMinutes` | `10` | How often to run (5-60 minutes) |
 | `RetentionDays` | `90` | Data retention period (7-365 days) |
 | `KMSKeyArn` | *(empty)* | KMS key for encryption (uses AES-256 if not specified) |
 
+The last three are available under "Customize advanced settings" during deployment.
+
 ---
 
-## Step 4: Run Analysis
+## Step 2: Run Analysis
 
 ### Automatic Collection (Future Data)
 
@@ -136,7 +71,7 @@ You can also invoke the Lambda manually to collect historical data. This is usef
 
 > **Important:** Historical analysis only works for time periods when CloudTrail was already configured. If you just enabled S3 data events, you can only retrieve historical data from that point forward.
 
-**4.1** Run analysis for the last 60 days (example):
+**2.1** Run analysis for the last 60 days (example):
 ```bash
 # Calculate dates for the last 60 days
 END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -153,7 +88,7 @@ aws lambda invoke \
 
 > **Note:** The maximum lookback is 90 days (CloudTrail API limit). S3 data events are only available if CloudTrail S3 logging was enabled during that period.
 
-**4.2** Run analysis for a specific time range:
+**2.2** Run analysis for a specific time range:
 ```bash
 aws lambda invoke \
   --function-name athena-usage-analyser-analyser \
@@ -165,40 +100,40 @@ aws lambda invoke \
 
 ---
 
-## Step 5: Retrieve Results
+## Step 3: Retrieve Results
 
-**5.1** List available exports:
+**3.1** List available exports:
 ```bash
 aws s3 ls s3://athena-usage-analyser-analysis-<ACCOUNT_ID>/exports/ --recursive
 ```
 
-**5.2** Download all exports:
+**3.2** Download all exports:
 ```bash
 aws s3 sync s3://athena-usage-analyser-analysis-<ACCOUNT_ID>/exports/ ./exports/
 ```
 
-**5.3** Generate analysis report (see [ANALYSIS.md](ANALYSIS.md) for details):
+**3.3** Generate analysis report (see [ANALYSIS.md](ANALYSIS.md) for details):
 ```bash
 python3 analyse_exports.py ./exports/
 ```
 
 ---
 
-## Step 6: Cleanup
+## Step 4: Cleanup
 
-**6.1** Empty the S3 bucket:
+**4.1** Empty the S3 bucket:
 ```bash
 aws s3 rm s3://athena-usage-analyser-analysis-<ACCOUNT_ID> --recursive
 ```
 
-**6.2** Delete the CloudFormation stack:
+**4.2** Delete the CloudFormation stack:
 ```bash
 aws cloudformation delete-stack \
   --stack-name athena-usage-analyser \
   --region <REGION>
 ```
 
-**6.3** (Optional) Delete the retained S3 bucket manually if needed:
+**4.3** (Optional) Delete the retained S3 bucket manually if needed:
 ```bash
 aws s3 rb s3://athena-usage-analyser-analysis-<ACCOUNT_ID>
 ```
