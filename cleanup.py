@@ -372,10 +372,10 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
                     f"  [dim]You can delete it manually: aws s3 rb s3://{bucket_name}[/dim]"
                 )
 
-    # 4. Optionally clean up local exports
+    # 4. Optionally clean up local exports and reports
     exports_dir = SCRIPT_DIR / "exports"
-    report_file = SCRIPT_DIR / "athena-usage-report.html"
-    local_files_exist = exports_dir.exists() or report_file.exists()
+    reports_dir = SCRIPT_DIR / "reports"
+    local_files_exist = exports_dir.exists() or reports_dir.exists()
 
     if local_files_exist:
         console.print()
@@ -385,16 +385,19 @@ def step_cleanup(region: str, stack_name: str, outputs: Dict[str, str]) -> None:
             console.print(
                 f"    • {exports_dir} ({zip_count} export{'s' if zip_count != 1 else ''})"
             )
-        if report_file.exists():
-            console.print(f"    • {report_file}")
+        if reports_dir.exists():
+            report_count = len(list(reports_dir.glob("*.html")))
+            console.print(
+                f"    • {reports_dir} ({report_count} report{'s' if report_count != 1 else ''})"
+            )
 
         if Confirm.ask("  Delete local exports and reports?", default=False):
             if exports_dir.exists():
                 shutil.rmtree(exports_dir)
                 console.print(f"  [green]✓[/green] Deleted {exports_dir}")
-            if report_file.exists():
-                report_file.unlink()
-                console.print(f"  [green]✓[/green] Deleted {report_file}")
+            if reports_dir.exists():
+                shutil.rmtree(reports_dir)
+                console.print(f"  [green]✓[/green] Deleted {reports_dir}")
 
     # Cross-account role cleanup guidance
     if is_multi_account:

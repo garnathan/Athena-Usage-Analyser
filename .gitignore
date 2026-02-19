@@ -28,8 +28,7 @@ ENV/
 *.zip
 
 # Generated reports
-*.html
-report
+reports/
 
 # Downloaded exports
 exports/

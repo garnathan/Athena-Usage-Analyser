@@ -3363,8 +3363,11 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     console.print("  Generating HTML report...")
     console.print()
 
-    report_name = "athena-usage-report.html"
-    report_path = SCRIPT_DIR / report_name
+    reports_dir = SCRIPT_DIR / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    report_name = f"athena-usage-report-{timestamp}.html"
+    report_path = reports_dir / report_name
 
     analyser = AthenaExportAnalyser(str(exports_path))
     file_count = analyser.load_exports()
