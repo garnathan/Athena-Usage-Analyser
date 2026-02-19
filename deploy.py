@@ -262,7 +262,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
     )
     console.print()
 
-    if not Confirm.ask("  Enable S3 data events?", default=False):
+    if not Confirm.ask("  Enable S3 data events?", default=True):
         console.print(
             "\n  [dim]Skipped — S3 bucket monitoring will not be available.[/dim]"
         )
