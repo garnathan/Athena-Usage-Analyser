@@ -17,6 +17,8 @@ CloudFormation-deployed Lambda that captures Athena usage via CloudTrail and gen
 ## Quick Start
 
 ```bash
+git clone https://github.com/garnathan/Athena-Usage-Analyser.git
+cd Athena-Usage-Analyser
 python3 deploy.py           # 1. Deploy
 python3 analyse_exports.py  # 2. Analyse
 python3 cleanup.py          # 3. Cleanup (when done)
