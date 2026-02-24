@@ -2,6 +2,18 @@
 
 CloudFormation-deployed Lambda that captures Athena usage via CloudTrail and generates usage and migration readiness reports.
 
+## Prerequisites
+
+- **Python 3.6+** installed
+- **AWS CLI** installed ([install guide](https://aws.amazon.com/cli/))
+- **AWS credentials configured** — the deploy script will verify credentials before proceeding and prompt you if they're missing. Set up via one of:
+  - `aws configure` (access key + secret key)
+  - `aws sso login` (AWS SSO / IAM Identity Center)
+  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
+  - IAM instance profile (if running on EC2)
+- **IAM permissions** — the deploying user/role needs permissions to create CloudFormation stacks, S3 buckets, Lambda functions, IAM roles, EventBridge rules, and read CloudTrail. An admin or `PowerUserAccess` + `IAMFullAccess` policy is recommended for deployment.
+- **For Organizations mode**: credentials must be for the management account (or a delegated administrator) with `organizations:ListAccounts` and `cloudformation:CreateStackSet` permissions.
+
 ## Quick Start
 
 ```bash
