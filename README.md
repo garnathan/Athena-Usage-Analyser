@@ -22,14 +22,7 @@ python3 analyse_exports.py  # 2. Analyse
 python3 cleanup.py          # 3. Cleanup (when done)
 ```
 
-All three scripts are interactive and guide you through each step. Requires the AWS CLI to be installed and configured.
-
-## What Gets Captured
-
-- Query patterns, types (SELECT, CTAS, DDL, etc.), and data scanned
-- Workgroup, user, database, and table usage
-- S3 bucket access patterns
-- Migration readiness: query complexity, DDL tracking, long-running queries, concurrency, partition usage, SQL compatibility flags, and a 0-100 readiness score
+All three scripts are interactive and guide you through each step.
 
 ## Deployment Modes
 
@@ -78,6 +71,13 @@ The deploy script asks for these interactively. All have sensible defaults.
 Each analysis run exports a zip to S3: `summary.json`, `athena_events.json`, `s3_events.json`, `workgroup_report.txt`, `workgroup_stats.csv`, and `per_account_summary.json` (multi-account only).
 
 The analysis script downloads these and generates an HTML report that opens in your browser. In multi-account mode, the report includes a per-account breakdown.
+
+## What Gets Captured
+
+- Query patterns, types (SELECT, CTAS, DDL, etc.), and data scanned
+- Workgroup, user, database, and table usage
+- S3 bucket access patterns
+- Migration readiness: query complexity, DDL tracking, long-running queries, concurrency, partition usage, SQL compatibility flags, and a 0-100 readiness score
 
 ## Security
 
