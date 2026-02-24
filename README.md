@@ -13,6 +13,7 @@ CloudFormation-deployed Lambda that captures Athena usage via CloudTrail and gen
   - IAM instance profile (if running on EC2)
 - **IAM permissions** — the deploying user/role needs permissions to create CloudFormation stacks, S3 buckets, Lambda functions, IAM roles, EventBridge rules, and read CloudTrail. An admin or `PowerUserAccess` + `IAMFullAccess` policy is recommended for deployment.
 - **For Organizations mode**: credentials must be for the management account (or a delegated administrator) with `organizations:ListAccounts` and `cloudformation:CreateStackSet` permissions.
+- **CloudTrail** — Athena API calls are management events, which AWS logs by default in all accounts. No extra setup is needed for basic Athena query capture. The deploy script verifies CloudTrail status and, if you want S3 bucket access patterns, offers to enable S3 data events on an existing trail (this incurs additional CloudTrail charges).
 
 ## Quick Start
 
