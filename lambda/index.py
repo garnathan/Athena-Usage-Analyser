@@ -1208,107 +1208,66 @@ def lambda_handler(event, context):
                 f"Using org trail S3 bucket: {ORG_TRAIL_BUCKET} "
                 f"(org {ORGANIZATION_ID})"
             )
+        else:
+            logger.info(
+                "ORG_TRAIL_BUCKET or ORGANIZATION_ID not configured — "
+                "falling back to per-account CloudTrail API via AssumeRole. "
+                "Run verify_setup.py to auto-detect and configure these."
+            )
 
-        # ------------------------------------------------------------------
-        # Strategy: query CloudTrail from the management account ONCE.
-        # If an organization trail is enabled, the management account's
-        # CloudTrail LookupEvents API returns events from ALL member
-        # accounts (via recipientAccountId).  This is far faster than
-        # AssumeRole into each of 82 accounts individually.
-        # ------------------------------------------------------------------
-        logger.info(
-            "Org mode: querying management account CloudTrail for ALL "
-            "accounts (org trail captures member account events)"
-        )
+        # Analyse the local (management) account first
         aggregate.process_cloudtrail_events(start_time, end_time)
         aggregate._fetch_query_strings()
         aggregate._process_fetched_queries()
 
-        # Tag events with their source account from recipientAccountId
-        # and build per-account summaries
-        account_event_counts = {}
-        for evt in aggregate.athena_events:
-            acct = evt.get("account_id") or evt.get("recipient_account_id", "local")
-            account_event_counts[acct] = account_event_counts.get(acct, 0) + 1
-
-        logger.info(
-            f"Management account CloudTrail returned "
-            f"{len(aggregate.athena_events)} athena events across "
-            f"{len(account_event_counts)} account(s)"
-        )
-        for acct, count in sorted(account_event_counts.items()):
-            logger.info(f"  Account {acct}: {count} events")
-
-        # If org trail bucket is configured, also read from S3 per-account
-        if use_org_trail:
-            for i, account_id in enumerate(discovered_accounts):
-                logger.info(
-                    f"--- Org trail S3: Account {i + 1}/"
-                    f"{len(discovered_accounts)}: {account_id} ---"
-                )
-                try:
+        for i, account_id in enumerate(discovered_accounts):
+            logger.info(
+                f"--- Account {i + 1}/{len(discovered_accounts)}: "
+                f"{account_id} ---"
+            )
+            try:
+                if use_org_trail:
                     acct_analyser = analyse_account_from_org_trail(
                         account_id, start_time, end_time
                     )
-                    if acct_analyser and (
-                        acct_analyser.athena_events or acct_analyser.s3_events
-                    ):
-                        acct_summary = acct_analyser.generate_summary()
-                        per_account_summaries.append(acct_summary)
-                        merge_analyser(aggregate, acct_analyser)
-                        logger.info(
-                            f"Account {account_id}: "
-                            f"{len(acct_analyser.athena_events)} athena events"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Org trail S3 read failed for {account_id}: {e}"
+                else:
+                    acct_analyser = analyse_account(
+                        account_id, start_time, end_time
                     )
-        else:
-            # No org trail bucket — try AssumeRole for enrichment only
-            # (query execution stats). Events are already captured above.
-            enriched = 0
-            for account_id in discovered_accounts:
-                if not aggregate.query_execution_ids:
-                    break
-                try:
-                    clients = get_cross_account_clients(account_id)
-                    # If we can assume the role, enrich with Athena stats
-                    acct_query_ids = {
-                        qid: info
-                        for qid, info in aggregate.query_execution_ids.items()
-                        if info.get("event", {}).get("account_id") == account_id
-                        or info.get("event", {}).get(
-                            "recipient_account_id"
-                        ) == account_id
-                    }
-                    if acct_query_ids and clients:
-                        enriched += 1
-                except (AssumeRoleError, Exception):
-                    pass  # Enrichment is optional — events already captured
-            if enriched:
-                logger.info(
-                    f"Enriched query stats from {enriched} account(s) "
-                    f"via cross-account roles"
-                )
-            else:
-                logger.info(
-                    "Cross-account roles not available — using CloudTrail "
-                    "data only (query strings from requestParameters, "
-                    "no execution stats)"
-                )
-
-        # Build per-account summaries from the aggregate data
-        if not per_account_summaries:
-            for acct, count in sorted(account_event_counts.items()):
-                if acct != "local":
-                    per_account_summaries.append({
-                        "account_id": acct,
+                if acct_analyser:
+                    acct_summary = acct_analyser.generate_summary()
+                    per_account_summaries.append(acct_summary)
+                    merge_analyser(aggregate, acct_analyser)
+                    logger.info(
+                        f"Account {account_id}: "
+                        f"{len(acct_analyser.athena_events)} athena events, "
+                        f"{len(acct_analyser.fetched_queries)} queries"
+                    )
+                else:
+                    logger.warning(
+                        f"Account {account_id}: no data"
+                    )
+                    per_account_summaries.append(
+                        {
+                            "account_id": account_id,
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        }
+                    )
+            except Exception as e:
+                logger.error(f"Error analysing account {account_id}: {str(e)}")
+                per_account_summaries.append(
+                    {
+                        "account_id": account_id,
+                        "error": str(e),
                         "overview": {
-                            "total_athena_events": count,
+                            "total_athena_events": 0,
                             "total_s3_events": 0,
                         },
-                    })
+                    }
+                )
         aggregate.start_time = start_time
         aggregate.end_time = end_time
 

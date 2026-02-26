@@ -605,9 +605,9 @@ def check_cloudtrail(region: str) -> bool:
 def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
     """Check 6: Org Trail Cross-Account Visibility.
 
-    Queries the management account's CloudTrail for Athena events and checks
-    whether events from member accounts are visible (via recipientAccountId).
-    This confirms whether the org trail approach will work without AssumeRole.
+    Probes the org trail S3 bucket for member account CloudTrail files.
+    If found, checks whether the Lambda has ORG_TRAIL_BUCKET configured.
+    Auto-fixes the Lambda env vars if missing.
     """
     console.print("\n[bold]6. Org Trail Cross-Account Visibility[/bold]")
 
@@ -617,106 +617,197 @@ def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
         console.print("  [dim]Skipped — not in org mode[/dim]")
         return True
 
-    console.print(
-        "  Querying management account CloudTrail for Athena events "
-        "across all accounts..."
+    # ---- Find the org trail and its S3 bucket ----
+    ok, output = run_aws(
+        ["cloudtrail", "describe-trails"], region=region, timeout=15,
     )
+    org_trail_bucket = ""
+    if ok:
+        try:
+            for trail in json.loads(output).get("trailList", []):
+                if trail.get("IsOrganizationTrail"):
+                    org_trail_bucket = trail.get("S3BucketName", "")
+                    break
+        except json.JSONDecodeError:
+            pass
 
-    # Query multiple Athena event types to maximize chances of finding
-    # cross-account events
-    athena_event_types = [
-        "StartQueryExecution",
-        "GetQueryExecution",
-        "ListWorkGroups",
-        "GetWorkGroup",
-        "ListNamedQueries",
-    ]
+    # Get org ID
+    org_id = ""
+    ok2, output2 = run_aws(
+        ["organizations", "describe-organization"], region=region, timeout=10,
+    )
+    if ok2:
+        try:
+            org_id = json.loads(output2).get("Organization", {}).get("Id", "")
+        except json.JSONDecodeError:
+            pass
 
-    all_events = []
-    for event_type in athena_event_types:
-        ok, output = run_aws(
-            [
-                "cloudtrail", "lookup-events",
-                "--lookup-attributes",
-                f"AttributeKey=EventName,AttributeValue={event_type}",
-                "--max-results", "20",
-            ],
-            region=region,
-            timeout=15,
-        )
-        if ok:
-            try:
-                all_events.extend(json.loads(output).get("Events", []))
-            except json.JSONDecodeError:
-                pass
-
-    if not all_events:
+    if not org_trail_bucket:
         console.print(
-            "  [yellow]![/yellow] No Athena events found in CloudTrail"
+            "  [yellow]![/yellow] No organization trail found."
         )
         console.print(
-            "    Run some Athena queries in member accounts and "
-            "wait ~5 min for events to appear."
+            "    Cross-account data requires either an org trail S3 "
+            "bucket or cross-account roles (StackSet)."
         )
         return True
 
-    # Parse each event to find recipientAccountId
-    accounts_seen = {}
-    event_types_seen = set()
-    for evt in all_events:
+    console.print(f"  Org trail bucket: [cyan]{org_trail_bucket}[/cyan]")
+    if org_id:
+        console.print(f"  Organization ID:  [cyan]{org_id}[/cyan]")
+
+    # ---- Probe S3 bucket for member account CloudTrail files ----
+    console.print()
+    console.print("  Scanning org trail bucket for member account data...")
+
+    s3_prefix = f"AWSLogs/{org_id}/" if org_id else "AWSLogs/"
+
+    ok, output = run_aws(
+        [
+            "s3api", "list-objects-v2",
+            "--bucket", org_trail_bucket,
+            "--prefix", s3_prefix,
+            "--delimiter", "/",
+            "--max-keys", "200",
+        ],
+        region=region,
+        timeout=15,
+    )
+
+    s3_account_ids = []
+    if ok:
         try:
-            event_data = json.loads(evt.get("CloudTrailEvent", "{}"))
-            acct = event_data.get("recipientAccountId", "unknown")
-            accounts_seen[acct] = accounts_seen.get(acct, 0) + 1
-            event_types_seen.add(evt.get("EventName", ""))
-        except (json.JSONDecodeError, TypeError):
+            prefixes = json.loads(output).get("CommonPrefixes", [])
+            for p in prefixes:
+                parts = p.get("Prefix", "").rstrip("/").split("/")
+                candidate = parts[-1] if parts else ""
+                if len(candidate) == 12 and candidate.isdigit():
+                    s3_account_ids.append(candidate)
+        except json.JSONDecodeError:
             pass
 
-    total_events = len(all_events)
-    total_accounts = len(accounts_seen)
+    if not s3_account_ids:
+        console.print(
+            f"  [yellow]![/yellow] No member account data found in "
+            f"org trail bucket"
+        )
+        return True
 
     console.print(
-        f"  [green]✓[/green] Found {total_events} Athena events "
-        f"across {total_accounts} account(s)"
+        f"  [green]✓[/green] [bold]Found CloudTrail data for "
+        f"{len(s3_account_ids)} account(s) in org trail bucket![/bold]"
     )
-    if event_types_seen:
-        console.print(
-            f"    Event types: {', '.join(sorted(event_types_seen))}"
-        )
+    for acct in s3_account_ids[:10]:
+        console.print(f"    Account {acct}")
+    if len(s3_account_ids) > 10:
+        console.print(f"    ... and {len(s3_account_ids) - 10} more")
 
-    # Show per-account breakdown
-    for acct, count in sorted(
-        accounts_seen.items(), key=lambda x: x[1], reverse=True
-    ):
-        console.print(f"    Account {acct}: {count} event(s)")
+    # ---- Check if Lambda has ORG_TRAIL_BUCKET configured ----
+    lambda_org_bucket = env.get("ORG_TRAIL_BUCKET", "")
+    lambda_org_id = env.get("ORGANIZATION_ID", "")
 
-    if total_accounts > 1:
+    if lambda_org_bucket and lambda_org_id:
         console.print()
         console.print(
-            "  [green]✓[/green] [bold]Org trail is working![/bold] "
-            "Member account events are visible from the management account."
+            f"  [green]✓[/green] Lambda configured: "
+            f"ORG_TRAIL_BUCKET={lambda_org_bucket}"
+        )
+        return True
+
+    # Auto-fix: set the env vars on the Lambda
+    console.print()
+    console.print(
+        "  [red]✗[/red] Lambda is MISSING org trail config!"
+    )
+    console.print(
+        f"    ORG_TRAIL_BUCKET: {lambda_org_bucket or '[red]NOT SET[/red]'}"
+    )
+    console.print(
+        f"    ORGANIZATION_ID:  {lambda_org_id or '[red]NOT SET[/red]'}"
+    )
+    console.print()
+    console.print(
+        "  [bold yellow]Auto-fixing: updating Lambda environment "
+        "variables...[/bold yellow]"
+    )
+
+    fn_name = env.get("_fn_name", "")
+    if not fn_name:
+        console.print(
+            "  [yellow]![/yellow] Cannot auto-fix (no function name). "
+            "Manually set these Lambda env vars:"
+        )
+        console.print(f"    ORG_TRAIL_BUCKET={org_trail_bucket}")
+        console.print(f"    ORGANIZATION_ID={org_id}")
+        return False
+
+    fix_ok = _auto_fix_lambda_org_config(
+        fn_name, region, org_trail_bucket, org_id
+    )
+    if fix_ok:
+        console.print(
+            "  [green]✓[/green] [bold]Lambda env vars updated![/bold]"
         )
         console.print(
-            "    The Lambda can collect data from all accounts without "
-            "needing cross-account roles."
+            f"    ORG_TRAIL_BUCKET={org_trail_bucket}"
         )
-    elif total_accounts == 1:
-        local_acct = list(accounts_seen.keys())[0]
+        console.print(f"    ORGANIZATION_ID={org_id}")
         console.print()
         console.print(
-            f"  [yellow]![/yellow] Only seeing events from 1 account "
-            f"({local_acct})."
+            "  The Lambda will now read CloudTrail data directly "
+            "from the org trail S3 bucket."
         )
         console.print(
-            "    If this is the management account, the org trail may "
-            "not be capturing member account events."
+            "  [bold]Re-run this script to verify the fix.[/bold]"
         )
+        return True
+    else:
         console.print(
-            "    Check: aws cloudtrail describe-trails — ensure "
-            "IsOrganizationTrail is true and IsMultiRegionTrail is true."
+            "  [red]✗[/red] Auto-fix failed. Manually set these "
+            "Lambda env vars:"
         )
+        console.print(f"    ORG_TRAIL_BUCKET={org_trail_bucket}")
+        console.print(f"    ORGANIZATION_ID={org_id}")
+        return False
 
-    return True
+
+def _auto_fix_lambda_org_config(
+    fn_name: str, region: str, org_trail_bucket: str, org_id: str
+) -> bool:
+    """Update Lambda env vars to add ORG_TRAIL_BUCKET and ORGANIZATION_ID."""
+    # Get current env vars
+    ok, output = run_aws(
+        [
+            "lambda", "get-function-configuration",
+            "--function-name", fn_name,
+            "--query", "Environment.Variables",
+        ],
+        region=region,
+    )
+    if not ok:
+        return False
+
+    try:
+        current_env = json.loads(output) or {}
+    except json.JSONDecodeError:
+        current_env = {}
+
+    current_env["ORG_TRAIL_BUCKET"] = org_trail_bucket
+    if org_id:
+        current_env["ORGANIZATION_ID"] = org_id
+
+    env_json = json.dumps({"Variables": current_env})
+
+    ok, output = run_aws(
+        [
+            "lambda", "update-function-configuration",
+            "--function-name", fn_name,
+            "--environment", env_json,
+        ],
+        region=region,
+        timeout=30,
+    )
+    return ok
 
 
 def check_lambda_logs(outputs: Dict[str, str], region: str) -> bool:
@@ -1593,6 +1684,8 @@ def main():
     # Get Lambda env for cross-account checks
     fn_name = outputs.get("LambdaFunctionName", "")
     env = _get_lambda_env(fn_name, region) if fn_name else {}
+    if fn_name:
+        env["_fn_name"] = fn_name  # stash for auto-fix in check 6
 
     # 3. Schedule
     schedule_ok = check_schedule(stack_name, region)
