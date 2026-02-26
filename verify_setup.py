@@ -622,31 +622,37 @@ def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
         "across all accounts..."
     )
 
-    # Query StartQueryExecution — the most common and useful Athena event
-    ok, output = run_aws(
-        [
-            "cloudtrail", "lookup-events",
-            "--lookup-attributes",
-            "AttributeKey=EventName,AttributeValue=StartQueryExecution",
-            "--max-results", "50",
-        ],
-        region=region,
-        timeout=30,
-    )
+    # Query multiple Athena event types to maximize chances of finding
+    # cross-account events
+    athena_event_types = [
+        "StartQueryExecution",
+        "GetQueryExecution",
+        "ListWorkGroups",
+        "GetWorkGroup",
+        "ListNamedQueries",
+    ]
 
-    if not ok:
-        console.print(f"  [red]✗[/red] CloudTrail query failed: {output}")
-        return False
+    all_events = []
+    for event_type in athena_event_types:
+        ok, output = run_aws(
+            [
+                "cloudtrail", "lookup-events",
+                "--lookup-attributes",
+                f"AttributeKey=EventName,AttributeValue={event_type}",
+                "--max-results", "20",
+            ],
+            region=region,
+            timeout=15,
+        )
+        if ok:
+            try:
+                all_events.extend(json.loads(output).get("Events", []))
+            except json.JSONDecodeError:
+                pass
 
-    try:
-        events = json.loads(output).get("Events", [])
-    except json.JSONDecodeError:
-        console.print("  [red]✗[/red] Could not parse CloudTrail response")
-        return False
-
-    if not events:
+    if not all_events:
         console.print(
-            "  [yellow]![/yellow] No StartQueryExecution events found"
+            "  [yellow]![/yellow] No Athena events found in CloudTrail"
         )
         console.print(
             "    Run some Athena queries in member accounts and "
@@ -656,21 +662,27 @@ def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
 
     # Parse each event to find recipientAccountId
     accounts_seen = {}
-    for evt in events:
+    event_types_seen = set()
+    for evt in all_events:
         try:
             event_data = json.loads(evt.get("CloudTrailEvent", "{}"))
             acct = event_data.get("recipientAccountId", "unknown")
             accounts_seen[acct] = accounts_seen.get(acct, 0) + 1
+            event_types_seen.add(evt.get("EventName", ""))
         except (json.JSONDecodeError, TypeError):
             pass
 
-    total_events = len(events)
+    total_events = len(all_events)
     total_accounts = len(accounts_seen)
 
     console.print(
-        f"  [green]✓[/green] Found {total_events} StartQueryExecution "
-        f"events across {total_accounts} account(s)"
+        f"  [green]✓[/green] Found {total_events} Athena events "
+        f"across {total_accounts} account(s)"
     )
+    if event_types_seen:
+        console.print(
+            f"    Event types: {', '.join(sorted(event_types_seen))}"
+        )
 
     # Show per-account breakdown
     for acct, count in sorted(
