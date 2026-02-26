@@ -1357,6 +1357,31 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
                         console.print(
                             f"    ... and {accts_failed - len(acct_errors)} more"
                         )
+                    # Diagnostic tips based on error pattern
+                    first_err = acct_errors[0].get("error", "")
+                    if "AccessDenied" in first_err or "not authorized" in first_err:
+                        console.print()
+                        console.print(
+                            "  [yellow]Diagnosis:[/yellow] The Lambda cannot "
+                            "assume the cross-account role."
+                        )
+                        console.print(
+                            "    Possible causes:"
+                        )
+                        console.print(
+                            "    1. StackSet still deploying roles to member "
+                            "accounts (check: aws cloudformation "
+                            "list-stack-instances --stack-set-name "
+                            "AthenaUsageAnalyserRole)"
+                        )
+                        console.print(
+                            "    2. ExternalId mismatch between Lambda env var "
+                            "and StackSet parameter"
+                        )
+                        console.print(
+                            "    3. CollectorStackName parameter in StackSet "
+                            "doesn't match actual stack name"
+                        )
 
         # Show errors
         errors = body.get("errors", [])
