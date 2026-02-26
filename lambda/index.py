@@ -1153,6 +1153,20 @@ def analyse_account_from_org_trail(account_id, start_time, end_time):
 # ---------------------------------------------------------------------------
 
 
+def _time_remaining_seconds(context):
+    """Return seconds remaining before Lambda timeout, or None if unknown."""
+    if context and hasattr(context, "get_remaining_time_in_millis"):
+        try:
+            return context.get_remaining_time_in_millis() / 1000.0
+        except Exception:
+            pass
+    return None
+
+
+# Minimum seconds to reserve for export/cleanup before Lambda times out
+TIMEOUT_BUFFER_SECONDS = 45
+
+
 def lambda_handler(event, context):
     logger.info("Lambda invoked with mode=%s", event.get("mode", MODE))
 
@@ -1199,6 +1213,7 @@ def lambda_handler(event, context):
 
     aggregate = AthenaUsageAnalyser()
     per_account_summaries = []
+    timed_out = False
 
     if ANALYSIS_MODE == "multi" and MULTI_ACCOUNT_METHOD == "org":
         # AWS Organizations mode: auto-discover accounts
@@ -1245,7 +1260,29 @@ def lambda_handler(event, context):
         aggregate._fetch_query_strings()
         aggregate._process_fetched_queries()
 
+        timed_out = False
         for i, account_id in enumerate(discovered_accounts):
+            # Check if we're about to run out of time
+            remaining = _time_remaining_seconds(context)
+            if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+                logger.warning(
+                    f"TIMEOUT approaching ({remaining:.0f}s left) — "
+                    f"stopping after {i}/{len(discovered_accounts)} accounts "
+                    f"to save partial results"
+                )
+                timed_out = True
+                # Mark remaining accounts as skipped
+                for skip_id in discovered_accounts[i:]:
+                    per_account_summaries.append({
+                        "account_id": skip_id,
+                        "error": "Skipped — Lambda timeout approaching",
+                        "overview": {
+                            "total_athena_events": 0,
+                            "total_s3_events": 0,
+                        },
+                    })
+                break
+
             logger.info(
                 f"--- Account {i + 1}/{len(discovered_accounts)}: "
                 f"{account_id} ---"
@@ -1312,7 +1349,28 @@ def lambda_handler(event, context):
         )
 
         # Then analyse each remote account via AssumeRole
+        timed_out = False
         for i, account_id in enumerate(MONITORED_ACCOUNTS):
+            # Check if we're about to run out of time
+            remaining = _time_remaining_seconds(context)
+            if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+                logger.warning(
+                    f"TIMEOUT approaching ({remaining:.0f}s left) — "
+                    f"stopping after {i}/{len(MONITORED_ACCOUNTS)} accounts "
+                    f"to save partial results"
+                )
+                timed_out = True
+                for skip_id in list(MONITORED_ACCOUNTS)[i:]:
+                    per_account_summaries.append({
+                        "account_id": skip_id,
+                        "error": "Skipped — Lambda timeout approaching",
+                        "overview": {
+                            "total_athena_events": 0,
+                            "total_s3_events": 0,
+                        },
+                    })
+                break
+
             logger.info(
                 f"--- Account {i + 1}/{len(MONITORED_ACCOUNTS)}: {account_id} ---"
             )
@@ -1389,12 +1447,20 @@ def lambda_handler(event, context):
                 len(aggregate.fetched_queries),
             )
 
+        message = "Analysis completed"
+        if timed_out:
+            message = "Analysis completed (PARTIAL — Lambda timeout approaching)"
+            logger.warning(
+                "Returning partial results due to approaching Lambda timeout"
+            )
+
         result = {
             "statusCode": 200,
             "body": {
-                "message": "Analysis completed",
+                "message": message,
                 "mode": run_mode,
                 "analysis_mode": ANALYSIS_MODE,
+                "partial": timed_out,
                 "analysis_period": {
                     "start": start_time.isoformat(),
                     "end": end_time.isoformat(),

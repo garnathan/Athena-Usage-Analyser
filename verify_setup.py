@@ -33,6 +33,7 @@ install_dependencies(["rich"])
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt
 from rich.table import Table
 from rich import box
 
@@ -1945,6 +1946,146 @@ def main():
         failed += 1
 
     _print_summary(passed, failed, warnings, total)
+
+    # Offer to persist auto-fixes into the CloudFormation stack
+    if passed == total and failed == 0:
+        _persist_fixes_to_stack(stack_name, region, env, outputs)
+
+
+def _persist_fixes_to_stack(
+    stack_name: str, region: str, env: Dict[str, str],
+    outputs: Dict[str, str],
+):
+    """Update the CFN stack parameters to match auto-fixed Lambda env vars.
+
+    This ensures a future stack update won't overwrite the fixes.
+    """
+    # Detect what the StackSet says vs what the stack has
+    ss_ext_id = ""
+    ok, output = run_aws(
+        [
+            "cloudformation", "describe-stack-set",
+            "--stack-set-name", "AthenaUsageAnalyserRole",
+        ],
+        region=region,
+    )
+    if ok:
+        try:
+            for p in json.loads(output).get("StackSet", {}).get("Parameters", []):
+                if p.get("ParameterKey") == "ExternalId":
+                    ss_ext_id = p["ParameterValue"]
+        except json.JSONDecodeError:
+            pass
+
+    # Get current stack parameters
+    ok, output = run_aws(
+        [
+            "cloudformation", "describe-stacks",
+            "--stack-name", stack_name,
+            "--query", "Stacks[0].Parameters",
+        ],
+        region=region,
+    )
+    if not ok:
+        return
+
+    try:
+        current_params = json.loads(output) or []
+    except json.JSONDecodeError:
+        return
+
+    current_map = {p["ParameterKey"]: p["ParameterValue"] for p in current_params}
+
+    # Build updates — only params that differ from what Lambda currently has
+    updates = {}
+    lambda_ext = env.get("CROSS_ACCOUNT_EXTERNAL_ID", "")
+    lambda_org_bucket = env.get("ORG_TRAIL_BUCKET", "")
+    lambda_org_id = env.get("ORGANIZATION_ID", "")
+
+    if lambda_ext and current_map.get("CrossAccountExternalId") != lambda_ext:
+        updates["CrossAccountExternalId"] = lambda_ext
+    if lambda_org_bucket and current_map.get("OrgTrailBucket") != lambda_org_bucket:
+        updates["OrgTrailBucket"] = lambda_org_bucket
+    if lambda_org_id and current_map.get("OrganizationId") != lambda_org_id:
+        updates["OrganizationId"] = lambda_org_id
+
+    if not updates:
+        return  # Nothing to persist
+
+    console.print()
+    console.print(
+        Panel(
+            "[bold yellow]CloudFormation stack parameters are out of date.[/bold yellow]\n\n"
+            "The verify script auto-fixed Lambda env vars, but these fixes\n"
+            "will be lost if the stack is redeployed. Update the stack now\n"
+            "to make the fixes permanent.",
+            title="Persist Fixes",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+    )
+
+    console.print("  Parameters to update:")
+    for k, v in updates.items():
+        display = v[:4] + "****" if "External" in k else v
+        console.print(f"    {k} = {display}")
+
+    try:
+        answer = Prompt.ask(
+            "\n  Update CloudFormation stack now?",
+            choices=["y", "n"],
+            default="y",
+        )
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    if answer != "y":
+        console.print("  [dim]Skipped. Run again to update later.[/dim]")
+        return
+
+    # Build parameter list — use previous values for unchanged params
+    param_list = []
+    for p in current_params:
+        key = p["ParameterKey"]
+        if key in updates:
+            param_list.append(
+                {"ParameterKey": key, "ParameterValue": updates[key]}
+            )
+        else:
+            param_list.append({"ParameterKey": key, "UsePreviousValue": True})
+
+    # Add any new params not in current stack
+    current_keys = {p["ParameterKey"] for p in current_params}
+    for key, val in updates.items():
+        if key not in current_keys:
+            param_list.append({"ParameterKey": key, "ParameterValue": val})
+
+    params_json = json.dumps(param_list)
+
+    console.print("  Updating stack...")
+    ok, output = run_aws(
+        [
+            "cloudformation", "update-stack",
+            "--stack-name", stack_name,
+            "--use-previous-template",
+            "--parameters", params_json,
+            "--capabilities", "CAPABILITY_NAMED_IAM",
+        ],
+        region=region,
+        timeout=60,
+    )
+
+    if ok:
+        console.print(
+            "  [green]✓[/green] Stack update initiated. "
+            "Fixes are now permanent."
+        )
+    elif "No updates are to be performed" in output:
+        console.print(
+            "  [green]✓[/green] Stack already up to date."
+        )
+    else:
+        console.print(f"  [red]✗[/red] Stack update failed: {output}")
 
 
 def _print_summary(passed: int, failed: int, warnings: int, total: int):

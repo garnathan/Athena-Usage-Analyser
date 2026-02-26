@@ -56,6 +56,29 @@ def validate_account_id(account_id: str) -> bool:
     return bool(re.match(r"^\d{12}$", account_id))
 
 
+def get_existing_external_id(stack_name: str = "athena-usage-analyser", region: str = "") -> str:
+    """Read the CrossAccountExternalId from an existing deployed stack.
+
+    Returns the ExternalId string if found, empty string otherwise.
+    """
+    ok, output = run_aws(
+        [
+            "cloudformation", "describe-stacks",
+            "--stack-name", stack_name,
+            "--query", "Stacks[0].Parameters",
+        ],
+        region=region,
+    )
+    if ok:
+        try:
+            for p in json.loads(output):
+                if p.get("ParameterKey") == "CrossAccountExternalId":
+                    return p.get("ParameterValue", "")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return ""
+
+
 def list_account_buckets(region: str) -> Optional[List[str]]:
     """List S3 buckets in the local AWS account.
 
@@ -731,9 +754,16 @@ def step_analysis_mode(account_id: str, region: str) -> Dict:
     for aid in account_ids:
         console.print(f"  [green]✓[/green] {aid}")
 
-    # ExternalId
+    # ExternalId — reuse existing if available to prevent mismatches
     console.print()
-    default_external_id = str(uuid.uuid4())
+    existing_eid = get_existing_external_id(region=region)
+    if existing_eid:
+        default_external_id = existing_eid
+        console.print(
+            f"  [dim]Found existing ExternalId from deployed stack: {existing_eid[:8]}...[/dim]"
+        )
+    else:
+        default_external_id = str(uuid.uuid4())
     external_id = Prompt.ask(
         "  ExternalId for cross-account trust [dim](auto-generated, or enter your own)[/dim]",
         default=default_external_id,
@@ -921,9 +951,26 @@ def step_org_setup(account_id: str, region: str) -> Dict:
     org_trail_bucket = ""
     if ok:
         trails = json.loads(output).get("trailList", [])
-        org_trails = [t for t in trails if t.get("IsOrganizationTrail")]
-        if org_trails:
-            org_trail = org_trails[0]
+        org_trail = None
+        # Priority 1: explicit IsOrganizationTrail
+        for t in trails:
+            if t.get("IsOrganizationTrail"):
+                org_trail = t
+                break
+        # Priority 2: Control Tower baseline trail
+        if not org_trail:
+            for t in trails:
+                bucket = t.get("S3BucketName", "")
+                if t.get("IsMultiRegionTrail") and "controltower" in bucket.lower():
+                    org_trail = t
+                    break
+        # Priority 3: any multi-region trail
+        if not org_trail:
+            for t in trails:
+                if t.get("IsMultiRegionTrail"):
+                    org_trail = t
+                    break
+        if org_trail:
             org_trail_bucket = org_trail.get("S3BucketName", "")
             console.print(
                 f"  [green]✓[/green] Organization Trail found: {org_trail.get('Name')}"
@@ -958,7 +1005,16 @@ def step_org_setup(account_id: str, region: str) -> Dict:
 
     external_id = ""
     if want_enrichment:
-        default_external_id = str(uuid.uuid4())
+        # Reuse existing ExternalId from a previous deployment if available,
+        # to prevent mismatches between the CFN stack and StackSet
+        existing_eid = get_existing_external_id(region=region)
+        if existing_eid:
+            default_external_id = existing_eid
+            console.print(
+                f"  [dim]Found existing ExternalId from deployed stack: {existing_eid[:8]}...[/dim]"
+            )
+        else:
+            default_external_id = str(uuid.uuid4())
         external_id = Prompt.ask(
             "  ExternalId for cross-account trust",
             default=default_external_id,
@@ -1067,8 +1123,46 @@ def deploy_org_stacksets(
     if not ss_ok:
         if "NameAlreadyExistsException" in ss_output:
             console.print(
-                f"  [green]✓[/green] StackSet [bold]{stackset_name}[/bold] already exists"
+                f"  [yellow]![/yellow] StackSet [bold]{stackset_name}[/bold] already exists — updating parameters..."
             )
+            # Update the existing StackSet with current parameters to keep
+            # ExternalId in sync with the main CFN stack
+            upd_ok, upd_output = run_aws(
+                [
+                    "cloudformation",
+                    "update-stack-set",
+                    "--stack-set-name",
+                    stackset_name,
+                    "--template-body",
+                    f"file://{cross_account_template}",
+                    "--capabilities",
+                    "CAPABILITY_NAMED_IAM",
+                    "--parameters",
+                    params,
+                ],
+                region=region,
+            )
+            if upd_ok:
+                console.print(
+                    f"  [green]✓[/green] StackSet parameters updated (ExternalId synced)"
+                )
+            elif "no updates" in upd_output.lower():
+                console.print(
+                    f"  [green]✓[/green] StackSet parameters already up to date"
+                )
+            else:
+                console.print(
+                    f"  [yellow]![/yellow] Could not update StackSet: {upd_output}"
+                )
+                console.print(
+                    "  [dim]The StackSet ExternalId may be out of sync. You can update it manually:[/dim]"
+                )
+                console.print(
+                    f"  [dim]  aws cloudformation update-stack-set --stack-set-name {stackset_name} "
+                    f"--use-previous-template --parameters "
+                    f"'ParameterKey=ExternalId,ParameterValue={external_id}' "
+                    f"--capabilities CAPABILITY_NAMED_IAM --region {region}[/dim]"
+                )
         else:
             console.print(
                 Panel(
