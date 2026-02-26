@@ -374,6 +374,12 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
     console.print()
     console.print("[bold]Step 1 · Region & CloudTrail[/bold]")
     console.print()
+    console.print(
+        "  This tool analyses Athena usage by reading CloudTrail logs.\n"
+        "  CloudTrail records every Athena API call (queries, DDL, etc.) automatically.\n"
+        "  First, select the AWS region where your Athena workloads run."
+    )
+    console.print()
 
     # Ask for region
     region = Prompt.ask(
@@ -427,18 +433,25 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: S3 Data Events
+# Step 3: S3 Data Events
 # ---------------------------------------------------------------------------
 
 
 def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
     """Optionally enable S3 data events. Returns the CloudTrail bucket name or None."""
     console.print()
-    console.print("[bold]Step 2 · S3 Data Events (Optional)[/bold]")
+    console.print("[bold]Step 3 · S3 Data Events (Optional)[/bold]")
     console.print()
     console.print(
-        "  S3 data events capture bucket-level access patterns (GetObject, PutObject, etc.).\n"
-        "  These are [bold]not[/bold] enabled by default and incur additional CloudTrail charges."
+        "  By default, CloudTrail only logs Athena [bold]API calls[/bold] (who ran queries, when, etc.).\n"
+        "  Enabling S3 data events adds [bold]bucket-level access tracking[/bold] — which S3 buckets\n"
+        "  are being read from or written to by Athena queries (GetObject, PutObject, etc.).\n"
+        "\n"
+        "  This is useful for understanding data access patterns and migration readiness,\n"
+        "  but it incurs [bold]additional CloudTrail charges[/bold] (per-event pricing).\n"
+        "\n"
+        "  If you skip this, the analyser will still capture all Athena query activity —\n"
+        "  you just won't see which S3 buckets those queries accessed."
     )
     console.print()
 
@@ -481,6 +494,12 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
         console.print(f"  Using trail: [cyan]{trail_name}[/cyan]")
 
     # Buckets to monitor — list account buckets and let user select
+    console.print()
+    console.print(
+        "  Select which S3 buckets to enable data event logging on.\n"
+        "  Choose the buckets that Athena reads from or writes to (e.g. data lake\n"
+        "  buckets, Athena query results buckets)."
+    )
     console.print()
     with console.status("  Listing S3 buckets..."):
         buckets_ok, buckets_output = run_aws(["s3api", "list-buckets"], region=region)
@@ -596,14 +615,20 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Analysis Mode
+# Step 2: Analysis Mode
 # ---------------------------------------------------------------------------
 
 
 def step_analysis_mode(account_id: str, region: str) -> Dict:
     """Ask whether to use single, multi-account, or AWS Organizations mode."""
     console.print()
-    console.print("[bold]Step 3 · Analysis Mode[/bold]")
+    console.print("[bold]Step 2 · Analysis Mode[/bold]")
+    console.print()
+    console.print(
+        "  Choose how many AWS accounts to analyse.\n"
+        "  Single-account is the simplest setup. Multi-account requires a read-only\n"
+        "  IAM role in each monitored account (the deploy script will guide you)."
+    )
     console.print()
     console.print(
         "  [bold]1[/bold]. Single AWS account    [dim](analyse this account only)[/dim]"
@@ -1107,15 +1132,19 @@ def step_bucket_selection(
     console.print()
     console.print("[bold]Step 4 · S3 Bucket Selection[/bold]")
     console.print()
+    console.print(
+        "  The analyser Lambda filters CloudTrail events to focus on specific S3 buckets.\n"
+        "  This controls which buckets appear in the usage report — for example, your\n"
+        "  data lake buckets or Athena query results buckets.\n"
+        "\n"
+        "  [bold]*[/bold] (auto-detect) is recommended — it pattern-matches common Athena-related\n"
+        "  bucket names at runtime (e.g. buckets containing 'athena', 'datalake', 'query-results')."
+    )
+    console.print()
 
     mode = analysis_config.get("mode", "single")
 
     if mode == "single":
-        console.print(
-            "  Select which S3 buckets the analyser should monitor.\n"
-            "  Use [bold]*[/bold] to auto-detect Athena-related buckets at runtime."
-        )
-        console.print()
         buckets = select_buckets_for_account(account_id, region, is_local=True)
         return encode_bucket_config({account_id: buckets})
 
@@ -1199,6 +1228,12 @@ def step_deploy(
 
     console.print()
     console.print("[bold]Step 5 · Configure & Deploy[/bold]")
+    console.print()
+    console.print(
+        "  Final configuration and CloudFormation deployment.\n"
+        "  This creates a Lambda function that runs on a schedule to collect\n"
+        "  Athena usage data and export it to S3 for analysis."
+    )
     console.print()
 
     # Stack name
@@ -1740,8 +1775,8 @@ def main():
 
     ctx = preflight_checks()
     region, trails = step_cloudtrail(ctx["default_region"])
-    cloudtrail_bucket = step_s3_events(region, trails)
     analysis_config = step_analysis_mode(ctx["account_id"], region)
+    cloudtrail_bucket = step_s3_events(region, trails)
     monitored_s3_buckets = step_bucket_selection(
         ctx["account_id"], region, analysis_config
     )
