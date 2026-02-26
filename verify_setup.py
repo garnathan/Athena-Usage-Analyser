@@ -365,6 +365,9 @@ def check_lambda(outputs: Dict[str, str], region: str) -> bool:
 
                     # Check ExternalId
                     lambda_ext = env.get("CROSS_ACCOUNT_EXTERNAL_ID", "")
+                    needs_fix = False
+                    fix_env = {}
+
                     if ss_ext_id and lambda_ext:
                         if ss_ext_id == lambda_ext:
                             console.print(
@@ -381,11 +384,76 @@ def check_lambda(outputs: Dict[str, str], region: str) -> bool:
                             console.print(
                                 f"    Lambda:   {lambda_ext[:4]}****"
                             )
+                            fix_env["CROSS_ACCOUNT_EXTERNAL_ID"] = ss_ext_id
+                            needs_fix = True
                             all_ok = False
+
+                    # Auto-fix mismatches by updating Lambda env vars
+                    # to match StackSet (StackSet is deployed to 82 accounts,
+                    # Lambda env is a single update)
+                    if needs_fix and fn_name:
+                        console.print()
+                        console.print(
+                            "  [bold yellow]Auto-fixing: updating Lambda "
+                            "env vars to match StackSet...[/bold yellow]"
+                        )
+                        ok_fix = _auto_fix_lambda_env(
+                            fn_name, region, fix_env
+                        )
+                        if ok_fix:
+                            for k, v in fix_env.items():
+                                display = v[:4] + "****" if k == "CROSS_ACCOUNT_EXTERNAL_ID" else v
+                                console.print(
+                                    f"  [green]✓[/green] Updated {k} = "
+                                    f"{display}"
+                                )
+                            console.print(
+                                "  [bold]Re-run verify_setup.py to "
+                                "test the fix.[/bold]"
+                            )
+                        else:
+                            console.print(
+                                "  [red]✗[/red] Auto-fix failed. "
+                                "Manually update the Lambda env vars."
+                            )
                 except json.JSONDecodeError:
                     pass
 
     return all_ok
+
+
+def _auto_fix_lambda_env(
+    fn_name: str, region: str, updates: Dict[str, str]
+) -> bool:
+    """Update specific Lambda environment variables."""
+    ok, output = run_aws(
+        [
+            "lambda", "get-function-configuration",
+            "--function-name", fn_name,
+            "--query", "Environment.Variables",
+        ],
+        region=region,
+    )
+    if not ok:
+        return False
+    try:
+        current_env = json.loads(output) or {}
+    except json.JSONDecodeError:
+        current_env = {}
+
+    current_env.update(updates)
+    env_json = json.dumps({"Variables": current_env})
+
+    ok, output = run_aws(
+        [
+            "lambda", "update-function-configuration",
+            "--function-name", fn_name,
+            "--environment", env_json,
+        ],
+        region=region,
+        timeout=30,
+    )
+    return ok
 
 
 def check_schedule(stack_name: str, region: str) -> bool:
@@ -943,39 +1011,10 @@ def _auto_fix_lambda_org_config(
     fn_name: str, region: str, org_trail_bucket: str, org_id: str
 ) -> bool:
     """Update Lambda env vars to add ORG_TRAIL_BUCKET and ORGANIZATION_ID."""
-    # Get current env vars
-    ok, output = run_aws(
-        [
-            "lambda", "get-function-configuration",
-            "--function-name", fn_name,
-            "--query", "Environment.Variables",
-        ],
-        region=region,
-    )
-    if not ok:
-        return False
-
-    try:
-        current_env = json.loads(output) or {}
-    except json.JSONDecodeError:
-        current_env = {}
-
-    current_env["ORG_TRAIL_BUCKET"] = org_trail_bucket
+    updates = {"ORG_TRAIL_BUCKET": org_trail_bucket}
     if org_id:
-        current_env["ORGANIZATION_ID"] = org_id
-
-    env_json = json.dumps({"Variables": current_env})
-
-    ok, output = run_aws(
-        [
-            "lambda", "update-function-configuration",
-            "--function-name", fn_name,
-            "--environment", env_json,
-        ],
-        region=region,
-        timeout=30,
-    )
-    return ok
+        updates["ORGANIZATION_ID"] = org_id
+    return _auto_fix_lambda_env(fn_name, region, updates)
 
 
 def check_lambda_logs(outputs: Dict[str, str], region: str) -> bool:
