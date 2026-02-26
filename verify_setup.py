@@ -15,7 +15,7 @@ Reads the deploy config (.deploy_config.json) and checks:
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -529,7 +529,6 @@ def check_cloudtrail(region: str) -> bool:
         # CloudTrail logs are stored at:
         # s3://bucket/AWSLogs/{org-id}/{account-id}/CloudTrail/{region}/YYYY/MM/DD/
         # List recent objects to confirm delivery is working
-        from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         date_prefix = now.strftime("%Y/%m/%d")
 
@@ -1231,8 +1230,13 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
 
     # Create temp files for the payload and response
     import tempfile
+    end_t = datetime.now(timezone.utc)
+    start_t = end_t - timedelta(minutes=5)
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as pf:
-        json.dump({"lookback_minutes": 5}, pf)
+        json.dump({
+            "start_time": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_time": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, pf)
         payload_file = pf.name
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
         output_file = rf.name
