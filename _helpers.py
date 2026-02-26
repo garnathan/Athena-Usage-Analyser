@@ -1,5 +1,7 @@
 """Shared helpers for Athena Usage Analyser scripts."""
 
+import importlib
+import site
 import subprocess
 import sys
 from typing import List, Optional, Tuple
@@ -7,28 +9,44 @@ from typing import List, Optional, Tuple
 
 def install_dependencies(packages: List[str]):
     """Install required packages if not already installed."""
+    any_installed = False
     for package in packages:
         try:
             __import__(package)
         except ImportError:
             print(f"Installing required package: {package}...")
-            try:
-                subprocess.check_call(
-                    ["pip3", "install", "--user", package],
-                    stdout=subprocess.DEVNULL,
-                )
-                print(f"  {package} installed successfully.")
-            except subprocess.CalledProcessError:
+            install_cmds = [
+                [sys.executable, "-m", "pip", "install", "--user", package],
+                [sys.executable, "-m", "pip", "install", "--break-system-packages", package],
+                ["pip3", "install", "--user", package],
+                ["pip3", "install", "--break-system-packages", package],
+            ]
+            installed = False
+            for cmd in install_cmds:
                 try:
                     subprocess.check_call(
-                        ["pip3", "install", "--break-system-packages", package],
-                        stdout=subprocess.DEVNULL,
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                     print(f"  {package} installed successfully.")
-                except subprocess.CalledProcessError as e:
-                    print(f"  Failed to install {package}: {e}")
-                    print(f"  Please run: pip3 install {package}")
-                    sys.exit(1)
+                    installed = True
+                    any_installed = True
+                    break
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    continue
+            if not installed:
+                print(f"  Failed to install {package}.")
+                print(f"  Please run: {sys.executable} -m pip install {package}")
+                sys.exit(1)
+
+    if any_installed:
+        # Refresh sys.path so newly-installed packages are importable
+        importlib.invalidate_caches()
+        # Add user site-packages if not already present
+        user_site = site.getusersitepackages()
+        if user_site and user_site not in sys.path:
+            sys.path.insert(0, user_site)
+        # Reload site to pick up any .pth files
+        importlib.reload(site)
 
 
 def run_aws(
