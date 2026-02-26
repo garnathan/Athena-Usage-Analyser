@@ -496,9 +496,11 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
     # Buckets to monitor — list account buckets and let user select
     console.print()
     console.print(
-        "  Select which S3 buckets to enable data event logging on.\n"
-        "  Choose the buckets that Athena reads from or writes to (e.g. data lake\n"
-        "  buckets, Athena query results buckets)."
+        "  Select which S3 buckets in [bold]this account[/bold] to enable data event\n"
+        "  logging on. Choose the buckets that Athena reads from or writes to\n"
+        "  (e.g. data lake buckets, Athena query results buckets).\n"
+        "\n"
+        "  If Athena data is only in remote accounts, you can skip this."
     )
     console.print()
     with console.status("  Listing S3 buckets..."):
@@ -508,24 +510,33 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
         console.print(
             f"  [yellow]![/yellow] Could not list S3 buckets: {buckets_output}"
         )
-        console.print("  [dim]Enter bucket names manually instead.[/dim]")
-        buckets_input = Prompt.ask("  S3 buckets to monitor (comma-separated)")
+        console.print("  [dim]Enter bucket names manually, or press Enter to skip.[/dim]")
+        buckets_input = Prompt.ask(
+            "  S3 buckets to monitor (comma-separated, or Enter to skip)",
+            default="",
+        )
         bucket_names = [b.strip() for b in buckets_input.split(",") if b.strip()]
     else:
         all_buckets = [b["Name"] for b in json.loads(buckets_output).get("Buckets", [])]
         if not all_buckets:
             console.print("  [yellow]![/yellow] No S3 buckets found in this account.")
-            buckets_input = Prompt.ask("  S3 buckets to monitor (comma-separated)")
-            bucket_names = [b.strip() for b in buckets_input.split(",") if b.strip()]
+            console.print("  [dim]Skipping S3 data events for this account.[/dim]")
+            bucket_names = []
         else:
             console.print()
             for i, name in enumerate(all_buckets, 1):
                 console.print(f"  [bold]{i:>3}[/bold]. {name}")
+            console.print(f"  [bold]  s[/bold]. Skip — no buckets to monitor in this account")
             console.print()
             while True:
                 selection = Prompt.ask(
-                    "  Select buckets (comma-separated numbers, e.g. 1,3,5)"
+                    "  Select buckets (comma-separated numbers, or s to skip)",
+                    default="s",
                 )
+                if selection.strip().lower() == "s":
+                    bucket_names = []
+                    console.print("  [dim]Skipped — no S3 data events for this account.[/dim]")
+                    break
                 try:
                     indices = [
                         int(s.strip()) for s in selection.split(",") if s.strip()
@@ -536,14 +547,18 @@ def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
                 except ValueError:
                     pass
                 console.print(
-                    f"  [red]✗[/red] Enter numbers between 1 and {len(all_buckets)}, separated by commas."
+                    f"  [red]✗[/red] Enter numbers between 1 and {len(all_buckets)}, "
+                    "separated by commas, or s to skip."
                 )
 
             for b in bucket_names:
                 console.print(f"  [green]✓[/green] {b}")
 
     if not bucket_names:
-        console.print("  [red]✗[/red] No buckets provided. Skipping S3 data events.")
+        console.print(
+            "\n  [dim]Skipped — S3 data events not enabled for this account.\n"
+            "  Athena query data will still be captured from CloudTrail.[/dim]"
+        )
         return None
 
     # Build data resource ARNs
