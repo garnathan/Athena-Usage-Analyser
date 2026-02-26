@@ -3445,7 +3445,25 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     analyser.generate_html_report(str(report_path))
     console.print(f"  [green]✓[/green] Report generated: {report_path}")
 
-    # Auto-open
+    # Upload report to the Lambda's S3 bucket for easy download from EC2
+    s3_report_url = ""
+    if bucket_name:
+        s3_key = f"reports/{report_name}"
+        s3_dest = f"s3://{bucket_name}/{s3_key}"
+        with console.status(f"  Uploading report to {s3_dest}..."):
+            ok, output = _run_aws(
+                ["s3", "cp", str(report_path), s3_dest],
+                region=region,
+            )
+        if ok:
+            console.print(f"  [green]✓[/green] Report uploaded to S3")
+            s3_report_url = s3_dest
+        else:
+            console.print(
+                f"  [yellow]![/yellow] Could not upload report to S3: {output}"
+            )
+
+    # Auto-open (useful on local machines, skipped silently on EC2)
     try:
         if sys.platform == "darwin":
             subprocess.run(["open", str(report_path)], check=True)
@@ -3458,13 +3476,31 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
 
     # Success panel
     console.print()
+    panel_lines = [
+        f"  [green]✓[/green] Exports:  {exports_path} ({len(zip_files)} files)",
+        f"  [green]✓[/green] Report:   {report_path}",
+    ]
+    if s3_report_url:
+        panel_lines.append(f"  [green]✓[/green] S3:       {s3_report_url}")
+        panel_lines.append("")
+        panel_lines.append(
+            "  [bold]Download from EC2:[/bold]"
+        )
+        panel_lines.append(
+            f"  aws s3 cp {s3_report_url} ."
+        )
+    else:
+        panel_lines.append("")
+        panel_lines.append(
+            "  The report should open in your browser automatically."
+        )
+        panel_lines.append(
+            f"  If not, open [bold]{report_name}[/bold] manually."
+        )
+
     console.print(
         Panel(
-            f"  [green]✓[/green] Exports:  {exports_path} ({len(zip_files)} files)\n"
-            f"  [green]✓[/green] Report:   {report_path}\n"
-            f"\n"
-            f"  The report should open in your browser automatically.\n"
-            f"  If not, open [bold]{report_name}[/bold] manually.",
+            "\n".join(panel_lines),
             title="[green]Analysis Complete[/green]",
             border_style="green",
             padding=(1, 2),
