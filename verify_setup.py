@@ -250,7 +250,20 @@ def check_schedule(stack_name: str, region: str) -> bool:
     else:
         console.print(f"  [yellow]![/yellow] Schedule: {schedule} ({state})")
         console.print("    The schedule is disabled. The Lambda won't run automatically.")
-        console.print(f"    Enable it: aws events enable-rule --name {rule_name} --region {region}")
+
+        # Auto-enable
+        console.print("    Enabling schedule...")
+        enable_ok, enable_output = run_aws(
+            ["events", "enable-rule", "--name", rule_name],
+            region=region,
+        )
+        if enable_ok:
+            console.print(f"  [green]✓[/green] Schedule enabled successfully")
+        else:
+            console.print(f"  [red]✗[/red] Could not enable schedule: {enable_output}")
+            console.print(
+                f"    Run manually: aws events enable-rule --name {rule_name} --region {region}"
+            )
 
     return True
 
@@ -456,9 +469,18 @@ def check_cloudtrail(region: str) -> bool:
 
 
 def check_cross_account_roles(
-    outputs: Dict[str, str], env: Dict[str, str], region: str
+    outputs: Dict[str, str], env: Dict[str, str], region: str,
+    stack_name: str,
 ) -> bool:
-    """Check 6: Cross-account roles in remote accounts."""
+    """Check 6: Cross-account roles in remote accounts.
+
+    The cross-account role trusts the *Lambda execution role*, not the user
+    running this script.  So instead of trying to assume the role directly
+    (which will always fail from EC2), we:
+      a) Check StackSet instance deployment status (did the role get deployed?)
+      b) Attempt assume-role via the Lambda role (chain through it)
+      c) Show clear guidance when direct assume fails
+    """
     console.print("\n[bold]6. Cross-Account Roles[/bold]")
 
     analysis_mode = env.get("ANALYSIS_MODE", outputs.get("AnalysisMode", "single"))
@@ -483,7 +505,6 @@ def check_cross_account_roles(
         if ok:
             try:
                 accounts = json.loads(output).get("Accounts", [])
-                # Get local account
                 identity = _get_caller_identity(region)
                 local_account = identity.get("Account", "") if identity else ""
 
@@ -502,7 +523,6 @@ def check_cross_account_roles(
             console.print(
                 "    The Lambda role needs organizations:ListAccounts permission."
             )
-            # Fall back to MONITORED_ACCOUNT_IDS if set
             monitored = env.get("MONITORED_ACCOUNT_IDS", "")
             if monitored:
                 account_ids = [a.strip() for a in monitored.split(",") if a.strip()]
@@ -542,88 +562,163 @@ def check_cross_account_roles(
                 "Lambda will use per-account CloudTrail API (slower)"
             )
 
-    # Test each remote account
+    # --- Check StackSet deployment status ---
+    console.print()
+    stackset_name = "AthenaUsageAnalyserRole"
+    stackset_ok, stackset_output = run_aws(
+        [
+            "cloudformation", "list-stack-instances",
+            "--stack-set-name", stackset_name,
+        ],
+        region=region,
+    )
+
+    stackset_instances: Dict[str, Dict] = {}
+    if stackset_ok:
+        try:
+            summaries = json.loads(stackset_output).get("Summaries", [])
+            for s in summaries:
+                stackset_instances[s.get("Account", "")] = s
+            console.print(
+                f"  [green]✓[/green] StackSet '{stackset_name}' has "
+                f"{len(summaries)} instance(s)"
+            )
+        except json.JSONDecodeError:
+            pass
+    else:
+        console.print(
+            f"  [yellow]![/yellow] StackSet '{stackset_name}' not found — "
+            "roles may have been deployed manually"
+        )
+
+    # --- Attempt to assume the Lambda execution role for chained role testing ---
+    lambda_role_name = f"{stack_name}-lambda-role"
+    identity = _get_caller_identity(region)
+    local_account = identity.get("Account", "") if identity else ""
+    lambda_role_arn = f"arn:aws:iam::{local_account}:role/{lambda_role_name}"
+
+    console.print()
+    console.print(f"  Assuming Lambda role to test cross-account access...")
+    console.print(f"  [dim]{lambda_role_arn}[/dim]")
+
+    lambda_assume_ok, lambda_assume_output = run_aws(
+        [
+            "sts", "assume-role",
+            "--role-arn", lambda_role_arn,
+            "--role-session-name", "VerifySetupChained",
+            "--duration-seconds", "900",
+        ],
+        region=region,
+    )
+
+    lambda_creds: Optional[Dict[str, str]] = None
+    if lambda_assume_ok:
+        try:
+            creds_raw = json.loads(lambda_assume_output).get("Credentials", {})
+            lambda_creds = {
+                "AWS_ACCESS_KEY_ID": creds_raw.get("AccessKeyId", ""),
+                "AWS_SECRET_ACCESS_KEY": creds_raw.get("SecretAccessKey", ""),
+                "AWS_SESSION_TOKEN": creds_raw.get("SessionToken", ""),
+            }
+            console.print(f"  [green]✓[/green] Assumed Lambda role successfully")
+        except json.JSONDecodeError:
+            lambda_creds = None
+
+    if not lambda_creds:
+        console.print(
+            f"  [yellow]![/yellow] Cannot assume Lambda role from this session"
+        )
+        console.print(
+            "    The cross-account role trusts only the Lambda execution role, not your\n"
+            "    current credentials. This is expected if you are running as an EC2 user.\n"
+            "    [bold]Step 7 (Test Lambda Invocation) will verify cross-account access instead.[/bold]"
+        )
+
+    # --- Build results table ---
     console.print()
     all_ok = True
     accounts_with_no_events: List[str] = []
     results_table = Table(box=box.SIMPLE, pad_edge=True)
     results_table.add_column("Account", style="cyan", min_width=14)
-    results_table.add_column("Role", style="white")
-    results_table.add_column("AssumeRole", style="white")
-    results_table.add_column("CloudTrail", style="white")
-    results_table.add_column("Athena API", style="white")
-    results_table.add_column("Athena Events", style="white")
+    results_table.add_column("StackSet", style="white")
+
+    if lambda_creds:
+        results_table.add_column("AssumeRole", style="white")
+        results_table.add_column("CloudTrail", style="white")
+        results_table.add_column("Athena API", style="white")
+        results_table.add_column("Athena Events", style="white")
 
     for acct_id in account_ids:
-        role_ok, role_msg = _check_role_exists(
-            acct_id, CROSS_ACCOUNT_ROLE_NAME, external_id, region
-        )
-
-        if not role_ok:
-            results_table.add_row(
-                acct_id,
-                CROSS_ACCOUNT_ROLE_NAME,
-                f"[red]✗[/red] {role_msg}",
-                "[dim]-[/dim]",
-                "[dim]-[/dim]",
-                "[dim]-[/dim]",
-            )
+        # Check StackSet deployment status for this account
+        instance = stackset_instances.get(acct_id)
+        if instance:
+            ss_status = instance.get("Status", "UNKNOWN")
+            if ss_status == "CURRENT":
+                ss_display = "[green]✓ deployed[/green]"
+            elif "FAILED" in ss_status or "OUTDATED" in ss_status:
+                reason = instance.get("StatusReason", "")
+                ss_display = f"[red]✗ {ss_status}[/red]"
+                if reason:
+                    ss_display += f" ({reason[:50]})"
+                all_ok = False
+            else:
+                ss_display = f"[yellow]{ss_status}[/yellow]"
+        else:
+            ss_display = "[red]✗ not deployed[/red]"
             all_ok = False
+
+        if not lambda_creds:
+            results_table.add_row(acct_id, ss_display)
             continue
 
-        # Role assumed — now test CloudTrail and Athena access
-        # We need to use the temp credentials from AssumeRole
+        # We have Lambda creds — try to chain-assume the cross-account role
         assume_args = [
             "sts", "assume-role",
             "--role-arn", f"arn:aws:iam::{acct_id}:role/{CROSS_ACCOUNT_ROLE_NAME}",
-            "--role-session-name", "VerifySetup",
+            "--role-session-name", "VerifySetupChained",
             "--duration-seconds", "900",
         ]
         if external_id:
             assume_args += ["--external-id", external_id]
-        ok, assume_output = run_aws(assume_args, region=region)
+
+        ok, assume_output = _run_remote_aws(assume_args, region, lambda_creds)
         if not ok:
             results_table.add_row(
-                acct_id, CROSS_ACCOUNT_ROLE_NAME,
-                "[red]✗[/red]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]",
+                acct_id, ss_display,
+                f"[red]✗[/red]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]",
             )
             all_ok = False
             continue
 
         try:
-            creds = json.loads(assume_output).get("Credentials", {})
-        except json.JSONDecodeError:
+            remote_creds_raw = json.loads(assume_output).get("Credentials", {})
+            remote_creds = {
+                "AWS_ACCESS_KEY_ID": remote_creds_raw.get("AccessKeyId", ""),
+                "AWS_SECRET_ACCESS_KEY": remote_creds_raw.get("SecretAccessKey", ""),
+                "AWS_SESSION_TOKEN": remote_creds_raw.get("SessionToken", ""),
+            }
+        except (json.JSONDecodeError, AttributeError):
             results_table.add_row(
-                acct_id, CROSS_ACCOUNT_ROLE_NAME,
+                acct_id, ss_display,
                 "[red]✗[/red]", "[dim]-[/dim]", "[dim]-[/dim]", "[dim]-[/dim]",
             )
             all_ok = False
             continue
 
-        # Set temp creds as env vars for subprocess calls
-        cred_env = {
-            "AWS_ACCESS_KEY_ID": creds.get("AccessKeyId", ""),
-            "AWS_SECRET_ACCESS_KEY": creds.get("SecretAccessKey", ""),
-            "AWS_SESSION_TOKEN": creds.get("SessionToken", ""),
-        }
-
-        # Test CloudTrail access (permission check)
+        # Test CloudTrail access
         ct_ok = _test_remote_api(
-            [
-                "cloudtrail", "lookup-events",
-                "--max-results", "1",
-            ],
-            region, cred_env,
+            ["cloudtrail", "lookup-events", "--max-results", "1"],
+            region, remote_creds,
         )
 
-        # Test Athena access (permission check)
+        # Test Athena access
         athena_ok = _test_remote_api(
             ["athena", "list-work-groups", "--max-results", "1"],
-            region, cred_env,
+            region, remote_creds,
         )
 
-        # Check for actual Athena events in this account's CloudTrail
-        athena_events = _count_remote_athena_events(region, cred_env)
+        # Check for actual Athena events
+        athena_events = _count_remote_athena_events(region, remote_creds)
 
         ct_status = "[green]✓[/green]" if ct_ok else "[red]✗[/red]"
         athena_status = "[green]✓[/green]" if athena_ok else "[red]✗[/red]"
@@ -634,7 +729,7 @@ def check_cross_account_roles(
         )
 
         results_table.add_row(
-            acct_id, CROSS_ACCOUNT_ROLE_NAME,
+            acct_id, ss_display,
             "[green]✓[/green]", ct_status, athena_status, events_status,
         )
         if not ct_ok or not athena_ok:
@@ -645,24 +740,28 @@ def check_cross_account_roles(
     console.print(results_table)
 
     # Diagnosis for accounts with no Athena events
-    if accounts_with_no_events:
+    if accounts_with_no_events and lambda_creds:
         console.print()
         console.print(
             Panel(
                 f"  {len(accounts_with_no_events)} account(s) have no recent Athena events:\n"
-                f"  {', '.join(accounts_with_no_events)}\n"
+                f"  {', '.join(accounts_with_no_events[:10])}"
+                + (f"\n  ...and {len(accounts_with_no_events) - 10} more"
+                   if len(accounts_with_no_events) > 10 else "")
+                + "\n"
                 "\n"
                 "  Possible reasons:\n"
                 "  1. No one has run Athena queries in these accounts recently\n"
                 "  2. CloudTrail management events are not enabled in these accounts\n"
                 "  3. The org trail is not capturing events from these accounts\n"
-                "     → Check the org trail's event selectors include management events\n"
-                "  4. Events are present but the Athena event source filter found nothing\n"
-                "     → Run a test query in the remote account and wait a few minutes\n"
+                "     → Check the org trail event selectors include management events\n"
+                "  4. Events exist but not for athena.amazonaws.com yet\n"
+                "     → Run a test query in the remote account and wait ~5 minutes\n"
                 "\n"
                 "  [bold]To check manually from a remote account:[/bold]\n"
                 "  aws cloudtrail lookup-events \\\n"
-                "    --lookup-attributes AttributeKey=EventSource,AttributeValue=athena.amazonaws.com \\\n"
+                "    --lookup-attributes AttributeKey=EventSource,"
+                "AttributeValue=athena.amazonaws.com \\\n"
                 "    --max-results 5",
                 title="[yellow]No Athena Events in Remote Accounts[/yellow]",
                 border_style="yellow",
@@ -672,26 +771,29 @@ def check_cross_account_roles(
 
     if not all_ok:
         console.print()
+        identity = _get_caller_identity(region)
+        local_acct = identity.get("Account", "<YOUR_COLLECTOR_ACCOUNT>") if identity else "<YOUR_COLLECTOR_ACCOUNT>"
         console.print(
             Panel(
                 "  Some remote accounts failed verification.\n"
                 "\n"
                 "  Common causes:\n"
-                "  1. Cross-account role does not exist in the remote account\n"
-                "     → Deploy the StackSet or manually create the role\n"
-                "  2. Trust policy mismatch (wrong collector account or external ID)\n"
-                "     → Check the role's trust policy in IAM\n"
-                "  3. The Lambda role lacks sts:AssumeRole permission\n"
-                "     → Redeploy with multi-account mode enabled\n"
+                "  1. Cross-account role not deployed in remote account\n"
+                "     → Check StackSet status or deploy manually (see below)\n"
+                "  2. Trust policy references wrong collector account or external ID\n"
+                f"     → Collector account: {local_acct}\n"
+                f"     → Stack name: {stack_name}\n"
+                f"     → Lambda role: {stack_name}-lambda-role\n"
+                "  3. External ID mismatch between collector and remote roles\n"
                 "\n"
-                "  [bold]To manually create the role in a remote account:[/bold]\n"
+                "  [bold]To manually deploy the role in a remote account:[/bold]\n"
                 "  aws cloudformation create-stack \\\n"
                 "    --stack-name AthenaUsageAnalyserRole \\\n"
                 "    --template-body file://cloudformation/cross-account-role.json \\\n"
                 "    --capabilities CAPABILITY_NAMED_IAM \\\n"
                 "    --parameters \\\n"
-                "      ParameterKey=CollectorAccountId,ParameterValue=<YOUR_COLLECTOR_ACCOUNT> \\\n"
-                "      ParameterKey=CollectorStackName,ParameterValue=<YOUR_STACK_NAME> \\\n"
+                f"      ParameterKey=CollectorAccountId,ParameterValue={local_acct} \\\n"
+                f"      ParameterKey=CollectorStackName,ParameterValue={stack_name} \\\n"
                 "      ParameterKey=ExternalId,ParameterValue=<YOUR_EXTERNAL_ID>",
                 title="[yellow]Troubleshooting[/yellow]",
                 border_style="yellow",
@@ -959,7 +1061,7 @@ def main():
         failed += 1
 
     # 6. Cross-Account Roles
-    xaccount_ok = check_cross_account_roles(outputs, env, region)
+    xaccount_ok = check_cross_account_roles(outputs, env, region, stack_name)
     if xaccount_ok:
         passed += 1
     else:
