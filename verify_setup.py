@@ -622,12 +622,44 @@ def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
         ["cloudtrail", "describe-trails"], region=region, timeout=15,
     )
     org_trail_bucket = ""
+    trail_name = ""
+    all_trails = []
     if ok:
         try:
-            for trail in json.loads(output).get("trailList", []):
+            all_trails = json.loads(output).get("trailList", [])
+            # Priority 1: explicit IsOrganizationTrail
+            for trail in all_trails:
                 if trail.get("IsOrganizationTrail"):
                     org_trail_bucket = trail.get("S3BucketName", "")
+                    trail_name = trail.get("Name", "")
                     break
+            # Priority 2: Control Tower baseline trail (multi-region,
+            # bucket name contains "controltower")
+            if not org_trail_bucket:
+                for trail in all_trails:
+                    bucket = trail.get("S3BucketName", "")
+                    if (
+                        trail.get("IsMultiRegionTrail")
+                        and "controltower" in bucket.lower()
+                    ):
+                        org_trail_bucket = bucket
+                        trail_name = trail.get("Name", "")
+                        console.print(
+                            f"  [green]✓[/green] Detected Control Tower "
+                            f"trail: {trail_name}"
+                        )
+                        break
+            # Priority 3: any multi-region trail
+            if not org_trail_bucket:
+                for trail in all_trails:
+                    if trail.get("IsMultiRegionTrail"):
+                        org_trail_bucket = trail.get("S3BucketName", "")
+                        trail_name = trail.get("Name", "")
+                        console.print(
+                            f"  [yellow]![/yellow] Using multi-region "
+                            f"trail: {trail_name}"
+                        )
+                        break
         except json.JSONDecodeError:
             pass
 
@@ -644,8 +676,17 @@ def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
 
     if not org_trail_bucket:
         console.print(
-            "  [yellow]![/yellow] No organization trail found."
+            "  [yellow]![/yellow] No organization or multi-region trail found."
         )
+        if all_trails:
+            console.print("    Trails found:")
+            for t in all_trails:
+                console.print(
+                    f"      {t.get('Name', '?')} — "
+                    f"bucket={t.get('S3BucketName', '?')} "
+                    f"multiRegion={t.get('IsMultiRegionTrail', '?')} "
+                    f"orgTrail={t.get('IsOrganizationTrail', '?')}"
+                )
         console.print(
             "    Cross-account data requires either an org trail S3 "
             "bucket or cross-account roles (StackSet)."
