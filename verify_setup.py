@@ -1642,7 +1642,7 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
     console.print(
         f"  Invoking {fn_name} with 5-minute lookback..."
     )
-    console.print("  [dim]This may take up to 60 seconds.[/dim]")
+    console.print("  [dim]This may take several minutes for org mode (82 accounts).[/dim]")
 
     # Create temp files for the payload and response
     import tempfile
@@ -1662,11 +1662,11 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
             "lambda", "invoke",
             "--function-name", fn_name,
             "--payload", f"fileb://{payload_file}",
-            "--cli-read-timeout", "120",
+            "--cli-read-timeout", "900",
             output_file,
         ],
         region=region,
-        timeout=180,
+        timeout=900,
     )
 
     if not ok:
