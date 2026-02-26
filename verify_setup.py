@@ -749,15 +749,79 @@ def check_cross_account_roles(
         if acct_id not in stackset_instances
     ]
 
-    if outdated_accounts and stackset_ok:
+    op_in_progress = False
+    if (outdated_accounts or not_deployed_accounts) and stackset_ok:
+        # Check if a StackSet operation is already in progress
+        list_ops_ok, list_ops_output = run_aws(
+            [
+                "cloudformation", "list-stack-set-operations",
+                "--stack-set-name", stackset_name,
+                "--max-results", "1",
+            ],
+            region=region,
+        )
+        if list_ops_ok:
+            try:
+                ops = json.loads(list_ops_output).get("Summaries", [])
+                if ops and ops[0].get("Status") == "RUNNING":
+                    op_in_progress = True
+                    op_id = ops[0].get("OperationId", "")
+                    console.print()
+                    console.print(
+                        f"  [yellow]![/yellow] A StackSet operation is already in progress"
+                    )
+                    console.print(
+                        f"    Operation: {op_id[:40]}..."
+                    )
+                    console.print(
+                        "    Waiting for it to complete before updating..."
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        if op_in_progress:
+            # Wait for the in-progress operation to finish (up to 5 minutes)
+            import time
+            waited = 0
+            max_wait = 300
+            while waited < max_wait:
+                time.sleep(15)
+                waited += 15
+                console.print(f"    [dim]Waiting... ({waited}s)[/dim]")
+                check_ok, check_output = run_aws(
+                    [
+                        "cloudformation", "list-stack-set-operations",
+                        "--stack-set-name", stackset_name,
+                        "--max-results", "1",
+                    ],
+                    region=region,
+                )
+                if check_ok:
+                    try:
+                        ops = json.loads(check_output).get("Summaries", [])
+                        if not ops or ops[0].get("Status") != "RUNNING":
+                            console.print(
+                                f"  [green]✓[/green] Previous operation completed"
+                            )
+                            op_in_progress = False
+                            break
+                    except json.JSONDecodeError:
+                        break
+
+            if op_in_progress:
+                console.print(
+                    "  [yellow]![/yellow] Previous operation still running after 5 minutes"
+                )
+                console.print(
+                    "    Re-run this script later to update OUTDATED instances."
+                )
+
+    if outdated_accounts and stackset_ok and not op_in_progress:
         console.print()
         console.print(
             f"  [yellow]![/yellow] {len(outdated_accounts)} account(s) have OUTDATED StackSet instances"
         )
-        console.print(
-            "    These accounts have a stale version of the cross-account role."
-        )
-        console.print("    Updating StackSet instances now...")
+        console.print("    Updating now...")
 
         update_ok, update_output = run_aws(
             [
@@ -777,22 +841,15 @@ def check_cross_account_roles(
             )
         else:
             console.print(
-                f"  [red]✗[/red] Could not update StackSet instances: {update_output}"
-            )
-            console.print(
-                "    Run manually:\n"
-                f"    aws cloudformation update-stack-instances \\\n"
-                f"      --stack-set-name {stackset_name} \\\n"
-                f"      --accounts {' '.join(outdated_accounts)} \\\n"
-                f"      --regions {region}"
+                f"  [red]✗[/red] Could not update: {update_output}"
             )
 
-    if not_deployed_accounts and stackset_ok:
+    if not_deployed_accounts and stackset_ok and not op_in_progress:
         console.print()
         console.print(
             f"  [yellow]![/yellow] {len(not_deployed_accounts)} account(s) have no StackSet instance"
         )
-        console.print("    Creating StackSet instances now...")
+        console.print("    Creating now...")
 
         create_ok, create_output = run_aws(
             [
@@ -807,12 +864,9 @@ def check_cross_account_roles(
             console.print(
                 f"  [green]✓[/green] StackSet deployment initiated for {len(not_deployed_accounts)} account(s)"
             )
-            console.print(
-                "    This may take a few minutes. Re-run this script to check progress."
-            )
         else:
             console.print(
-                f"  [red]✗[/red] Could not create StackSet instances: {create_output}"
+                f"  [red]✗[/red] Could not create: {create_output}"
             )
 
     # Diagnosis for accounts with no Athena events
