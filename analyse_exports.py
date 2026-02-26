@@ -3445,8 +3445,9 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     analyser.generate_html_report(str(report_path))
     console.print(f"  [green]✓[/green] Report generated: {report_path}")
 
-    # Upload report to the Lambda's S3 bucket for easy download from EC2
+    # Upload report to the analysis S3 bucket for easy download (e.g. from EC2)
     s3_report_url = ""
+    presigned_url = ""
     if bucket_name:
         s3_key = f"reports/{report_name}"
         s3_dest = f"s3://{bucket_name}/{s3_key}"
@@ -3458,6 +3459,13 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
         if ok:
             console.print(f"  [green]✓[/green] Report uploaded to S3")
             s3_report_url = s3_dest
+            # Generate a presigned URL (valid for 1 hour) for browser download
+            ok_url, url_output = _run_aws(
+                ["s3", "presign", s3_dest, "--expires-in", "3600"],
+                region=region,
+            )
+            if ok_url and url_output.strip():
+                presigned_url = url_output.strip()
         else:
             console.print(
                 f"  [yellow]![/yellow] Could not upload report to S3: {output}"
@@ -3483,12 +3491,14 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     if s3_report_url:
         panel_lines.append(f"  [green]✓[/green] S3:       {s3_report_url}")
         panel_lines.append("")
-        panel_lines.append(
-            "  [bold]Download from EC2:[/bold]"
-        )
-        panel_lines.append(
-            f"  aws s3 cp {s3_report_url} ."
-        )
+        panel_lines.append("  [bold]Download options:[/bold]")
+        panel_lines.append(f"  aws s3 cp {s3_report_url} .")
+        if presigned_url:
+            panel_lines.append("")
+            panel_lines.append(
+                "  [bold]Or open in browser (link valid for 1 hour):[/bold]"
+            )
+            panel_lines.append(f"  {presigned_url}")
     else:
         panel_lines.append("")
         panel_lines.append(
