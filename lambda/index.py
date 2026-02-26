@@ -1202,6 +1202,20 @@ def lambda_handler(event, context):
         discovered_accounts = discover_org_accounts()
         logger.info(f"Org mode: discovered {len(discovered_accounts)} member accounts")
 
+        # If MONITORED_ACCOUNT_IDS is set, filter to only those accounts
+        if MONITORED_ACCOUNTS:
+            filtered = [a for a in discovered_accounts if a in MONITORED_ACCOUNTS]
+            # Also include any monitored accounts not discovered (in case
+            # they're in a different OU or were manually added)
+            for a in MONITORED_ACCOUNTS:
+                if a not in filtered:
+                    filtered.append(a)
+            logger.info(
+                f"Filtered to {len(filtered)} monitored accounts "
+                f"(from {len(discovered_accounts)} discovered)"
+            )
+            discovered_accounts = filtered
+
         use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
         if use_org_trail:
             logger.info(
