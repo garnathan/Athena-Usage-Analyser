@@ -185,8 +185,16 @@ S3_EVENTS = frozenset(["GetObject", "PutObject", "ListObjects", "ListObjectsV2",
 # ---------------------------------------------------------------------------
 
 
+class AssumeRoleError(Exception):
+    """Raised when cross-account role assumption fails."""
+    pass
+
+
 def get_cross_account_clients(account_id):
-    """Assume role in a monitored account and return boto3 clients."""
+    """Assume role in a monitored account and return boto3 clients.
+
+    Raises AssumeRoleError on failure so callers can capture the message.
+    """
     role_arn = f"arn:aws:iam::{account_id}:role/AthenaUsageAnalyserReadRole"
     logger.info(f"Assuming role {role_arn} for account {account_id}")
     try:
@@ -212,7 +220,7 @@ def get_cross_account_clients(account_id):
         }
     except Exception as e:
         logger.error(f"Failed to assume role for account {account_id}: {str(e)}")
-        return None
+        raise AssumeRoleError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -1114,15 +1122,15 @@ def analyse_account_from_org_trail(account_id, start_time, end_time):
     # Try to enrich with Athena execution stats via cross-account role.
     # This is optional — query strings are already in CloudTrail.
     if acct_analyser.query_execution_ids:
-        clients = get_cross_account_clients(account_id)
-        if clients:
+        try:
+            clients = get_cross_account_clients(account_id)
             acct_analyser._fetch_query_strings(athena_cl=clients["athena"])
             logger.info(
                 f"Account {account_id}: enriched "
                 f"{len(acct_analyser.fetched_queries)} queries with "
                 f"execution stats"
             )
-        else:
+        except AssumeRoleError:
             logger.info(
                 f"Account {account_id}: cross-account role not available, "
                 f"using CloudTrail data only (query strings available, "
