@@ -782,8 +782,23 @@ def step_org_setup(account_id: str, region: str) -> Dict:
         ok, output = run_aws(["organizations", "list-accounts"], region=region)
 
     if not ok:
-        console.print(f"  [red]✗[/red] Failed to list accounts: {output}")
-        sys.exit(1)
+        console.print(
+            Panel(
+                "[red]Failed to list organization accounts.[/red]\n\n"
+                "This is usually a permissions issue. The deploying IAM user/role needs:\n"
+                "  • [bold]organizations:ListAccounts[/bold]\n\n"
+                "You can either:\n"
+                "  1. Add the missing permission and re-run\n"
+                "  2. Fall back to manual multi-account mode (enter account IDs manually)\n\n"
+                f"[dim]AWS error: {output}[/dim]",
+                title="Permission Issue",
+                border_style="yellow",
+            )
+        )
+        console.print()
+        if Confirm.ask("  Fall back to manual multi-account mode?", default=True):
+            return step_analysis_mode(account_id, region)
+        sys.exit(0)
 
     all_accounts = json.loads(output).get("Accounts", [])
     active_accounts = [a for a in all_accounts if a["Status"] == "ACTIVE"]
@@ -964,7 +979,25 @@ def deploy_org_stacksets(
                 f"  [green]✓[/green] StackSet [bold]{stackset_name}[/bold] already exists"
             )
         else:
-            console.print(f"  [red]✗[/red] Failed to create StackSet: {ss_output}")
+            console.print(
+                Panel(
+                    "[red]Failed to create StackSet.[/red]\n\n"
+                    "Common causes:\n"
+                    "  • Missing [bold]cloudformation:CreateStackSet[/bold] permission\n"
+                    "  • Missing [bold]iam:PassRole[/bold] permission\n"
+                    "  • Account is not the Organizations management account\n"
+                    "  • StackSets service-linked role not created yet\n"
+                    "    (run: [bold]aws iam create-service-linked-role "
+                    "--aws-service-name stacksets.cloudformation.amazonaws.com[/bold])\n\n"
+                    f"[dim]AWS error: {ss_output}[/dim]",
+                    title="StackSet Creation Failed",
+                    border_style="yellow",
+                )
+            )
+            console.print()
+            console.print(
+                "  You can deploy the cross-account roles manually instead:"
+            )
             _show_org_stacksets_manual_instructions(
                 account_id, stack_name, external_id, region
             )
@@ -996,12 +1029,26 @@ def deploy_org_stacksets(
                 "  [yellow]![/yellow] A StackSet operation is already in progress — "
                 "roles may already be deploying."
             )
-        elif "StackSetNotFoundException" in inst_output:
-            console.print(f"  [red]✗[/red] StackSet not found: {inst_output}")
-            return
         else:
             console.print(
-                f"  [red]✗[/red] Failed to create stack instances: {inst_output}"
+                Panel(
+                    "[red]Failed to deploy cross-account roles via StackSets.[/red]\n\n"
+                    "Common causes:\n"
+                    "  • Missing [bold]cloudformation:CreateStackInstances[/bold] permission\n"
+                    "  • StackSets not enabled for the Organization\n"
+                    "  • Target OU has Service Control Policies blocking CloudFormation\n\n"
+                    "This is [bold]not a blocker[/bold] — the analyser will still capture\n"
+                    "Athena query data from the Organization Trail. Cross-account roles\n"
+                    "only add execution stats (data scanned, timing).\n\n"
+                    "You can deploy the roles manually later if needed.\n\n"
+                    f"[dim]AWS error: {inst_output}[/dim]",
+                    title="StackSet Deployment Failed",
+                    border_style="yellow",
+                )
+            )
+            console.print()
+            _show_org_stacksets_manual_instructions(
+                account_id, stack_name, external_id, region
             )
             return
     else:
@@ -1019,6 +1066,33 @@ def deploy_org_stacksets(
     console.print(
         "  [dim]To check deployment status:[/dim]\n"
         f"  [dim]  aws cloudformation list-stack-instances --stack-set-name {stackset_name} --region {region}[/dim]"
+    )
+    console.print()
+    _show_org_troubleshooting(region)
+
+
+def _show_org_troubleshooting(region: str) -> None:
+    """Show troubleshooting tips for org mode."""
+    console.print(
+        Panel(
+            "[bold]If the analyser reports zero data for some accounts:[/bold]\n\n"
+            "  1. [bold]Organization Trail not enabled[/bold]\n"
+            "     The org trail must cover the target region. Verify:\n"
+            f"     aws cloudtrail describe-trails --region {region}\n"
+            "     Look for IsOrganizationTrail: true and IsMultiRegionTrail: true\n\n"
+            "  2. [bold]Cross-account role not yet deployed[/bold]\n"
+            "     StackSets take a few minutes. Check status:\n"
+            "     aws cloudformation list-stack-instances "
+            "--stack-set-name AthenaUsageAnalyserRole\n\n"
+            "  3. [bold]No Athena activity in that account[/bold]\n"
+            "     Some accounts may genuinely have no Athena usage — this is normal\n\n"
+            "  4. [bold]Lambda CloudWatch Logs[/bold]\n"
+            "     For detailed diagnostics, check the Lambda logs:\n"
+            "     aws logs tail /athena-usage-analyser/athena-usage-analyser --since 1h",
+            title="Troubleshooting Tips",
+            border_style="dim",
+            padding=(1, 2),
+        )
     )
     console.print()
 
@@ -1061,6 +1135,12 @@ def _show_org_stacksets_manual_instructions(
     console.print(
         "  [dim]To find your root OU ID:[/dim]\n"
         "  [dim]  aws organizations list-roots --query 'Roots[0].Id'[/dim]"
+    )
+    console.print()
+    console.print(
+        "  [dim]Note: Cross-account roles are [bold]optional[/bold] for org mode.\n"
+        "  Without them, the analyser still captures all Athena query data from the\n"
+        "  Organization Trail. Roles only add execution stats (data scanned, timing).[/dim]"
     )
     console.print()
 
