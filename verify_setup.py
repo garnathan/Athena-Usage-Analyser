@@ -7,9 +7,10 @@ Reads the deploy config (.deploy_config.json) and checks:
   3. EventBridge schedule rule exists
   4. S3 analysis bucket is accessible
   5. CloudTrail is logging management events
-  6. Lambda CloudWatch Logs (recent errors, warnings)
-  7. Cross-account roles exist and are assumable (multi-account/org mode)
-  8. Test invocation of the Lambda with a short lookback
+  6. Org trail cross-account visibility (can mgmt account see member events?)
+  7. Lambda CloudWatch Logs (recent errors, warnings)
+  8. Cross-account roles exist and are assumable (multi-account/org mode)
+  9. Test invocation of the Lambda with a short lookback
 """
 
 import json
@@ -601,9 +602,114 @@ def check_cloudtrail(region: str) -> bool:
     return all_ok
 
 
+def check_org_trail_visibility(env: Dict[str, str], region: str) -> bool:
+    """Check 6: Org Trail Cross-Account Visibility.
+
+    Queries the management account's CloudTrail for Athena events and checks
+    whether events from member accounts are visible (via recipientAccountId).
+    This confirms whether the org trail approach will work without AssumeRole.
+    """
+    console.print("\n[bold]6. Org Trail Cross-Account Visibility[/bold]")
+
+    analysis_mode = env.get("ANALYSIS_MODE", "single")
+    method = env.get("MULTI_ACCOUNT_METHOD", "manual")
+    if analysis_mode != "multi" or method != "org":
+        console.print("  [dim]Skipped — not in org mode[/dim]")
+        return True
+
+    console.print(
+        "  Querying management account CloudTrail for Athena events "
+        "across all accounts..."
+    )
+
+    # Query StartQueryExecution — the most common and useful Athena event
+    ok, output = run_aws(
+        [
+            "cloudtrail", "lookup-events",
+            "--lookup-attributes",
+            "AttributeKey=EventName,AttributeValue=StartQueryExecution",
+            "--max-results", "50",
+        ],
+        region=region,
+        timeout=30,
+    )
+
+    if not ok:
+        console.print(f"  [red]✗[/red] CloudTrail query failed: {output}")
+        return False
+
+    try:
+        events = json.loads(output).get("Events", [])
+    except json.JSONDecodeError:
+        console.print("  [red]✗[/red] Could not parse CloudTrail response")
+        return False
+
+    if not events:
+        console.print(
+            "  [yellow]![/yellow] No StartQueryExecution events found"
+        )
+        console.print(
+            "    Run some Athena queries in member accounts and "
+            "wait ~5 min for events to appear."
+        )
+        return True
+
+    # Parse each event to find recipientAccountId
+    accounts_seen = {}
+    for evt in events:
+        try:
+            event_data = json.loads(evt.get("CloudTrailEvent", "{}"))
+            acct = event_data.get("recipientAccountId", "unknown")
+            accounts_seen[acct] = accounts_seen.get(acct, 0) + 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    total_events = len(events)
+    total_accounts = len(accounts_seen)
+
+    console.print(
+        f"  [green]✓[/green] Found {total_events} StartQueryExecution "
+        f"events across {total_accounts} account(s)"
+    )
+
+    # Show per-account breakdown
+    for acct, count in sorted(
+        accounts_seen.items(), key=lambda x: x[1], reverse=True
+    ):
+        console.print(f"    Account {acct}: {count} event(s)")
+
+    if total_accounts > 1:
+        console.print()
+        console.print(
+            "  [green]✓[/green] [bold]Org trail is working![/bold] "
+            "Member account events are visible from the management account."
+        )
+        console.print(
+            "    The Lambda can collect data from all accounts without "
+            "needing cross-account roles."
+        )
+    elif total_accounts == 1:
+        local_acct = list(accounts_seen.keys())[0]
+        console.print()
+        console.print(
+            f"  [yellow]![/yellow] Only seeing events from 1 account "
+            f"({local_acct})."
+        )
+        console.print(
+            "    If this is the management account, the org trail may "
+            "not be capturing member account events."
+        )
+        console.print(
+            "    Check: aws cloudtrail describe-trails — ensure "
+            "IsOrganizationTrail is true and IsMultiRegionTrail is true."
+        )
+
+    return True
+
+
 def check_lambda_logs(outputs: Dict[str, str], region: str) -> bool:
-    """Check 6: Lambda CloudWatch Logs — recent invocations and errors."""
-    console.print("\n[bold]6. Lambda CloudWatch Logs[/bold]")
+    """Check 7: Lambda CloudWatch Logs — recent invocations and errors."""
+    console.print("\n[bold]7. Lambda CloudWatch Logs[/bold]")
 
     fn_name = outputs.get("LambdaFunctionName", "")
     if not fn_name:
@@ -739,7 +845,7 @@ def check_cross_account_roles(
     outputs: Dict[str, str], env: Dict[str, str], region: str,
     stack_name: str,
 ) -> bool:
-    """Check 7: Cross-account roles in remote accounts.
+    """Check 8: Cross-account roles in remote accounts.
 
     The cross-account role trusts the *Lambda execution role*, not the user
     running this script.  So instead of trying to assume the role directly
@@ -748,7 +854,7 @@ def check_cross_account_roles(
       b) Attempt assume-role via the Lambda role (chain through it)
       c) Show clear guidance when direct assume fails
     """
-    console.print("\n[bold]7. Cross-Account Roles[/bold]")
+    console.print("\n[bold]8. Cross-Account Roles[/bold]")
 
     analysis_mode = env.get("ANALYSIS_MODE", outputs.get("AnalysisMode", "single"))
     if analysis_mode == "single":
@@ -1215,8 +1321,8 @@ def _count_remote_athena_events(region: str, cred_env: Dict[str, str]) -> int:
 
 
 def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
-    """Check 8: Test invoke the Lambda with a short lookback."""
-    console.print("\n[bold]8. Test Lambda Invocation[/bold]")
+    """Check 9: Test invoke the Lambda with a short lookback."""
+    console.print("\n[bold]9. Test Lambda Invocation[/bold]")
 
     fn_name = outputs.get("LambdaFunctionName", "")
     if not fn_name:
@@ -1451,7 +1557,7 @@ def main():
     passed = 0
     failed = 0
     warnings = 0
-    total = 8
+    total = 9
 
     # 1. Stack
     stack_ok, outputs = check_stack(stack_name, region)
@@ -1497,21 +1603,28 @@ def main():
     else:
         failed += 1
 
-    # 6. Lambda CloudWatch Logs
+    # 6. Org Trail Cross-Account Visibility
+    org_trail_ok = check_org_trail_visibility(env, region)
+    if org_trail_ok:
+        passed += 1
+    else:
+        failed += 1
+
+    # 7. Lambda CloudWatch Logs
     logs_ok = check_lambda_logs(outputs, region)
     if logs_ok:
         passed += 1
     else:
         failed += 1
 
-    # 7. Cross-Account Roles
+    # 8. Cross-Account Roles
     xaccount_ok = check_cross_account_roles(outputs, env, region, stack_name)
     if xaccount_ok:
         passed += 1
     else:
         failed += 1
 
-    # 8. Test Invocation
+    # 9. Test Invocation
     invoke_ok = check_test_invocation(outputs, region)
     if invoke_ok:
         passed += 1
