@@ -739,6 +739,82 @@ def check_cross_account_roles(
 
     console.print(results_table)
 
+    # Fix OUTDATED StackSet instances
+    outdated_accounts = [
+        acct_id for acct_id in account_ids
+        if stackset_instances.get(acct_id, {}).get("Status") == "OUTDATED"
+    ]
+    not_deployed_accounts = [
+        acct_id for acct_id in account_ids
+        if acct_id not in stackset_instances
+    ]
+
+    if outdated_accounts and stackset_ok:
+        console.print()
+        console.print(
+            f"  [yellow]![/yellow] {len(outdated_accounts)} account(s) have OUTDATED StackSet instances"
+        )
+        console.print(
+            "    These accounts have a stale version of the cross-account role."
+        )
+        console.print("    Updating StackSet instances now...")
+
+        update_ok, update_output = run_aws(
+            [
+                "cloudformation", "update-stack-instances",
+                "--stack-set-name", stackset_name,
+                "--accounts", *outdated_accounts,
+                "--regions", region,
+            ],
+            region=region,
+        )
+        if update_ok:
+            console.print(
+                f"  [green]✓[/green] StackSet update initiated for {len(outdated_accounts)} account(s)"
+            )
+            console.print(
+                "    This may take a few minutes. Re-run this script to check progress."
+            )
+        else:
+            console.print(
+                f"  [red]✗[/red] Could not update StackSet instances: {update_output}"
+            )
+            console.print(
+                "    Run manually:\n"
+                f"    aws cloudformation update-stack-instances \\\n"
+                f"      --stack-set-name {stackset_name} \\\n"
+                f"      --accounts {' '.join(outdated_accounts)} \\\n"
+                f"      --regions {region}"
+            )
+
+    if not_deployed_accounts and stackset_ok:
+        console.print()
+        console.print(
+            f"  [yellow]![/yellow] {len(not_deployed_accounts)} account(s) have no StackSet instance"
+        )
+        console.print("    Creating StackSet instances now...")
+
+        create_ok, create_output = run_aws(
+            [
+                "cloudformation", "create-stack-instances",
+                "--stack-set-name", stackset_name,
+                "--accounts", *not_deployed_accounts,
+                "--regions", region,
+            ],
+            region=region,
+        )
+        if create_ok:
+            console.print(
+                f"  [green]✓[/green] StackSet deployment initiated for {len(not_deployed_accounts)} account(s)"
+            )
+            console.print(
+                "    This may take a few minutes. Re-run this script to check progress."
+            )
+        else:
+            console.print(
+                f"  [red]✗[/red] Could not create StackSet instances: {create_output}"
+            )
+
     # Diagnosis for accounts with no Athena events
     if accounts_with_no_events and lambda_creds:
         console.print()
