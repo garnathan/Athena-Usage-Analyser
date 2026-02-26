@@ -1130,50 +1130,42 @@ def step_bucket_selection(
     CloudFormation parameter (``"*"``, CSV, or JSON).
     """
     console.print()
-    console.print("[bold]Step 4 · S3 Bucket Selection[/bold]")
+    console.print("[bold]Step 4 · S3 Bucket Filtering[/bold]")
     console.print()
     console.print(
-        "  The analyser Lambda filters CloudTrail events to focus on specific S3 buckets.\n"
-        "  This controls which buckets appear in the usage report — for example, your\n"
-        "  data lake buckets or Athena query results buckets.\n"
+        "  The analyser automatically detects Athena-related S3 buckets at runtime\n"
+        "  by matching common naming patterns (e.g. buckets containing 'athena',\n"
+        "  'query-results', 'datalake', 'data-lake', 'analytics', 'warehouse').\n"
         "\n"
-        "  [bold]*[/bold] (auto-detect) is recommended — it pattern-matches common Athena-related\n"
-        "  bucket names at runtime (e.g. buckets containing 'athena', 'datalake', 'query-results')."
+        "  [green]✓[/green] Auto-detect is enabled by default — no configuration needed."
     )
     console.print()
 
+    if not Confirm.ask(
+        "  Use auto-detect? [dim](recommended — or choose N to select specific buckets)[/dim]",
+        default=True,
+    ):
+        return _manual_bucket_selection(account_id, region, analysis_config)
+
+    console.print("  [green]✓[/green] Auto-detect enabled for all accounts")
+    return "*"
+
+
+def _manual_bucket_selection(
+    account_id: str,
+    region: str,
+    analysis_config: Dict,
+) -> str:
+    """Manually select S3 buckets when the user opts out of auto-detect."""
     mode = analysis_config.get("mode", "single")
 
     if mode == "single":
+        console.print()
         buckets = select_buckets_for_account(account_id, region, is_local=True)
         return encode_bucket_config({account_id: buckets})
 
     # Multi-account mode
     all_account_ids = [account_id] + analysis_config.get("account_ids", [])
-
-    console.print(
-        f"  {len(all_account_ids)} account{'s' if len(all_account_ids) != 1 else ''} to configure "
-        f"(1 local + {len(all_account_ids) - 1} remote)"
-    )
-    console.print()
-    console.print(
-        "  [bold]1[/bold]. Use auto-detect (*) for all accounts "
-        "[dim](recommended — detects Athena-related buckets at runtime)[/dim]"
-    )
-    console.print(
-        "  [bold]2[/bold]. Configure each account individually"
-    )
-    console.print()
-
-    approach = Prompt.ask(
-        "  How to configure S3 buckets?",
-        choices=["1", "2"],
-        default="1",
-    )
-
-    if approach == "1":
-        console.print("  [green]✓[/green] All accounts: auto-detect (*)")
-        return "*"
 
     # Individual selection
     bucket_map: Dict[str, List[str]] = {}
