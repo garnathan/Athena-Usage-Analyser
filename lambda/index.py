@@ -1167,8 +1167,234 @@ def _time_remaining_seconds(context):
 TIMEOUT_BUFFER_SECONDS = 45
 
 
+def _process_all_accounts(aggregate, per_account_summaries, start_time,
+                          end_time, context, max_accounts):
+    """Run account processing with a safety net for partial-export on crash.
+
+    Returns True if processing was cut short (timeout or error), False if
+    all accounts were processed normally.
+    """
+    timed_out = False
+    try:
+        if ANALYSIS_MODE == "multi" and MULTI_ACCOUNT_METHOD == "org":
+            # AWS Organizations mode: auto-discover accounts
+            discovered_accounts = discover_org_accounts()
+            logger.info(f"Org mode: discovered {len(discovered_accounts)} member accounts")
+
+            # If MONITORED_ACCOUNT_IDS is set, filter to only those accounts
+            if MONITORED_ACCOUNTS:
+                filtered = [a for a in discovered_accounts if a in MONITORED_ACCOUNTS]
+                for a in MONITORED_ACCOUNTS:
+                    if a not in filtered:
+                        filtered.append(a)
+                logger.info(
+                    f"Filtered to {len(filtered)} monitored accounts "
+                    f"(from {len(discovered_accounts)} discovered)"
+                )
+                discovered_accounts = filtered
+
+            # Apply max_accounts limit (for quick test invocations)
+            if max_accounts and len(discovered_accounts) > max_accounts:
+                logger.info(
+                    f"Limiting to {max_accounts} accounts (of "
+                    f"{len(discovered_accounts)}) for quick test"
+                )
+                discovered_accounts = discovered_accounts[:max_accounts]
+
+            use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
+            if use_org_trail:
+                logger.info(
+                    f"Using org trail S3 bucket: {ORG_TRAIL_BUCKET} "
+                    f"(org {ORGANIZATION_ID})"
+                )
+            else:
+                logger.info(
+                    "ORG_TRAIL_BUCKET or ORGANIZATION_ID not configured — "
+                    "falling back to per-account CloudTrail API via AssumeRole. "
+                    "Run verify_setup.py to auto-detect and configure these."
+                )
+
+            # Analyse the local (management) account first
+            aggregate.process_cloudtrail_events(start_time, end_time)
+            aggregate._fetch_query_strings()
+            aggregate._process_fetched_queries()
+
+            for i, account_id in enumerate(discovered_accounts):
+                # Check if we're about to run out of time
+                remaining = _time_remaining_seconds(context)
+                if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+                    logger.warning(
+                        f"TIMEOUT approaching ({remaining:.0f}s left) — "
+                        f"stopping after {i}/{len(discovered_accounts)} accounts "
+                        f"to save partial results"
+                    )
+                    timed_out = True
+                    for skip_id in discovered_accounts[i:]:
+                        per_account_summaries.append({
+                            "account_id": skip_id,
+                            "error": "Skipped — Lambda timeout approaching",
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                    break
+
+                logger.info(
+                    f"--- Account {i + 1}/{len(discovered_accounts)}: "
+                    f"{account_id} ---"
+                )
+                try:
+                    if use_org_trail:
+                        acct_analyser = analyse_account_from_org_trail(
+                            account_id, start_time, end_time
+                        )
+                    else:
+                        acct_analyser = analyse_account(
+                            account_id, start_time, end_time
+                        )
+                    if acct_analyser:
+                        acct_summary = acct_analyser.generate_summary()
+                        per_account_summaries.append(acct_summary)
+                        merge_analyser(aggregate, acct_analyser)
+                        logger.info(
+                            f"Account {account_id}: "
+                            f"{len(acct_analyser.athena_events)} athena events, "
+                            f"{len(acct_analyser.fetched_queries)} queries"
+                        )
+                    else:
+                        logger.warning(
+                            f"Account {account_id}: no data"
+                        )
+                        per_account_summaries.append({
+                            "account_id": account_id,
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                except Exception as e:
+                    logger.error(f"Error analysing account {account_id}: {str(e)}")
+                    per_account_summaries.append({
+                        "account_id": account_id,
+                        "error": str(e),
+                        "overview": {
+                            "total_athena_events": 0,
+                            "total_s3_events": 0,
+                        },
+                    })
+            aggregate.start_time = start_time
+            aggregate.end_time = end_time
+
+        elif ANALYSIS_MODE == "multi" and MONITORED_ACCOUNTS:
+            # Manual multi-account mode: explicit account IDs + AssumeRole
+            logger.info(
+                f"Multi-account mode: analysing local account + "
+                f"{len(MONITORED_ACCOUNTS)} remote accounts"
+            )
+            aggregate.process_cloudtrail_events(start_time, end_time)
+            aggregate._fetch_query_strings()
+            aggregate._process_fetched_queries()
+            logger.info(
+                f"Local account: {len(aggregate.athena_events)} athena events, "
+                f"{len(aggregate.fetched_queries)} queries fetched"
+            )
+
+            for i, account_id in enumerate(MONITORED_ACCOUNTS):
+                remaining = _time_remaining_seconds(context)
+                if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+                    logger.warning(
+                        f"TIMEOUT approaching ({remaining:.0f}s left) — "
+                        f"stopping after {i}/{len(MONITORED_ACCOUNTS)} accounts "
+                        f"to save partial results"
+                    )
+                    timed_out = True
+                    for skip_id in list(MONITORED_ACCOUNTS)[i:]:
+                        per_account_summaries.append({
+                            "account_id": skip_id,
+                            "error": "Skipped — Lambda timeout approaching",
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                    break
+
+                logger.info(
+                    f"--- Account {i + 1}/{len(MONITORED_ACCOUNTS)}: "
+                    f"{account_id} ---"
+                )
+                try:
+                    acct_analyser = analyse_account(account_id, start_time, end_time)
+                    if acct_analyser:
+                        acct_summary = acct_analyser.generate_summary()
+                        per_account_summaries.append(acct_summary)
+                        merge_analyser(aggregate, acct_analyser)
+                        logger.info(
+                            f"Account {account_id}: "
+                            f"{len(acct_analyser.athena_events)} athena events, "
+                            f"{len(acct_analyser.fetched_queries)} queries fetched"
+                        )
+                    else:
+                        per_account_summaries.append({
+                            "account_id": account_id,
+                            "error": "Failed to assume role",
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                except Exception as e:
+                    logger.error(f"Error analysing account {account_id}: {str(e)}")
+                    per_account_summaries.append({
+                        "account_id": account_id,
+                        "error": str(e),
+                        "overview": {
+                            "total_athena_events": 0,
+                            "total_s3_events": 0,
+                        },
+                    })
+                # Rate-limit: 1-second delay between accounts
+                if i < len(MONITORED_ACCOUNTS) - 1:
+                    time.sleep(1)
+            aggregate.start_time = start_time
+            aggregate.end_time = end_time
+
+        else:
+            # Single-account mode — existing behaviour
+            aggregate.process_cloudtrail_events(start_time, end_time)
+            aggregate._fetch_query_strings()
+            aggregate._process_fetched_queries()
+
+    except Exception as e:
+        # Safety net: if anything unexpected escapes the per-account
+        # try/except blocks (e.g. discover_org_accounts() or merge_analyser()
+        # blows up), log it and let the caller export partial results.
+        logger.error(
+            "UNHANDLED ERROR during account processing: %s — "
+            "partial results will be exported",
+            str(e),
+            exc_info=True,
+        )
+        timed_out = True
+
+    return timed_out
+
+
 def lambda_handler(event, context):
     logger.info("Lambda invoked with mode=%s", event.get("mode", MODE))
+    logger.info(
+        "CONFIG: ANALYSIS_MODE=%s MULTI_ACCOUNT_METHOD=%s "
+        "MONITORED_ACCOUNTS=%d ORG_TRAIL_BUCKET=%s ORGANIZATION_ID=%s "
+        "OUTPUT_BUCKET=%s TIMEOUT_BUFFER=%ds",
+        ANALYSIS_MODE,
+        MULTI_ACCOUNT_METHOD,
+        len(MONITORED_ACCOUNTS),
+        ORG_TRAIL_BUCKET or "(not set)",
+        ORGANIZATION_ID or "(not set)",
+        OUTPUT_BUCKET or "(not set)",
+        TIMEOUT_BUFFER_SECONDS,
+    )
 
     run_mode = event.get("mode", MODE).upper()
 
@@ -1213,213 +1439,10 @@ def lambda_handler(event, context):
 
     aggregate = AthenaUsageAnalyser()
     per_account_summaries = []
-    timed_out = False
-
-    if ANALYSIS_MODE == "multi" and MULTI_ACCOUNT_METHOD == "org":
-        # AWS Organizations mode: auto-discover accounts
-        discovered_accounts = discover_org_accounts()
-        logger.info(f"Org mode: discovered {len(discovered_accounts)} member accounts")
-
-        # If MONITORED_ACCOUNT_IDS is set, filter to only those accounts
-        if MONITORED_ACCOUNTS:
-            filtered = [a for a in discovered_accounts if a in MONITORED_ACCOUNTS]
-            # Also include any monitored accounts not discovered (in case
-            # they're in a different OU or were manually added)
-            for a in MONITORED_ACCOUNTS:
-                if a not in filtered:
-                    filtered.append(a)
-            logger.info(
-                f"Filtered to {len(filtered)} monitored accounts "
-                f"(from {len(discovered_accounts)} discovered)"
-            )
-            discovered_accounts = filtered
-
-        # Apply max_accounts limit (for quick test invocations)
-        if max_accounts and len(discovered_accounts) > max_accounts:
-            logger.info(
-                f"Limiting to {max_accounts} accounts (of "
-                f"{len(discovered_accounts)}) for quick test"
-            )
-            discovered_accounts = discovered_accounts[:max_accounts]
-
-        use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
-        if use_org_trail:
-            logger.info(
-                f"Using org trail S3 bucket: {ORG_TRAIL_BUCKET} "
-                f"(org {ORGANIZATION_ID})"
-            )
-        else:
-            logger.info(
-                "ORG_TRAIL_BUCKET or ORGANIZATION_ID not configured — "
-                "falling back to per-account CloudTrail API via AssumeRole. "
-                "Run verify_setup.py to auto-detect and configure these."
-            )
-
-        # Analyse the local (management) account first
-        aggregate.process_cloudtrail_events(start_time, end_time)
-        aggregate._fetch_query_strings()
-        aggregate._process_fetched_queries()
-
-        timed_out = False
-        for i, account_id in enumerate(discovered_accounts):
-            # Check if we're about to run out of time
-            remaining = _time_remaining_seconds(context)
-            if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
-                logger.warning(
-                    f"TIMEOUT approaching ({remaining:.0f}s left) — "
-                    f"stopping after {i}/{len(discovered_accounts)} accounts "
-                    f"to save partial results"
-                )
-                timed_out = True
-                # Mark remaining accounts as skipped
-                for skip_id in discovered_accounts[i:]:
-                    per_account_summaries.append({
-                        "account_id": skip_id,
-                        "error": "Skipped — Lambda timeout approaching",
-                        "overview": {
-                            "total_athena_events": 0,
-                            "total_s3_events": 0,
-                        },
-                    })
-                break
-
-            logger.info(
-                f"--- Account {i + 1}/{len(discovered_accounts)}: "
-                f"{account_id} ---"
-            )
-            try:
-                if use_org_trail:
-                    acct_analyser = analyse_account_from_org_trail(
-                        account_id, start_time, end_time
-                    )
-                else:
-                    acct_analyser = analyse_account(
-                        account_id, start_time, end_time
-                    )
-                if acct_analyser:
-                    acct_summary = acct_analyser.generate_summary()
-                    per_account_summaries.append(acct_summary)
-                    merge_analyser(aggregate, acct_analyser)
-                    logger.info(
-                        f"Account {account_id}: "
-                        f"{len(acct_analyser.athena_events)} athena events, "
-                        f"{len(acct_analyser.fetched_queries)} queries"
-                    )
-                else:
-                    logger.warning(
-                        f"Account {account_id}: no data"
-                    )
-                    per_account_summaries.append(
-                        {
-                            "account_id": account_id,
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        }
-                    )
-            except Exception as e:
-                logger.error(f"Error analysing account {account_id}: {str(e)}")
-                per_account_summaries.append(
-                    {
-                        "account_id": account_id,
-                        "error": str(e),
-                        "overview": {
-                            "total_athena_events": 0,
-                            "total_s3_events": 0,
-                        },
-                    }
-                )
-        aggregate.start_time = start_time
-        aggregate.end_time = end_time
-
-    elif ANALYSIS_MODE == "multi" and MONITORED_ACCOUNTS:
-        # Manual multi-account mode: explicit account IDs + AssumeRole
-        # First, analyse the local (collector) account
-        logger.info(
-            f"Multi-account mode: analysing local account + "
-            f"{len(MONITORED_ACCOUNTS)} remote accounts"
-        )
-        aggregate.process_cloudtrail_events(start_time, end_time)
-        aggregate._fetch_query_strings()
-        aggregate._process_fetched_queries()
-        logger.info(
-            f"Local account: {len(aggregate.athena_events)} athena events, "
-            f"{len(aggregate.fetched_queries)} queries fetched"
-        )
-
-        # Then analyse each remote account via AssumeRole
-        timed_out = False
-        for i, account_id in enumerate(MONITORED_ACCOUNTS):
-            # Check if we're about to run out of time
-            remaining = _time_remaining_seconds(context)
-            if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
-                logger.warning(
-                    f"TIMEOUT approaching ({remaining:.0f}s left) — "
-                    f"stopping after {i}/{len(MONITORED_ACCOUNTS)} accounts "
-                    f"to save partial results"
-                )
-                timed_out = True
-                for skip_id in list(MONITORED_ACCOUNTS)[i:]:
-                    per_account_summaries.append({
-                        "account_id": skip_id,
-                        "error": "Skipped — Lambda timeout approaching",
-                        "overview": {
-                            "total_athena_events": 0,
-                            "total_s3_events": 0,
-                        },
-                    })
-                break
-
-            logger.info(
-                f"--- Account {i + 1}/{len(MONITORED_ACCOUNTS)}: {account_id} ---"
-            )
-            try:
-                acct_analyser = analyse_account(account_id, start_time, end_time)
-                if acct_analyser:
-                    acct_summary = acct_analyser.generate_summary()
-                    per_account_summaries.append(acct_summary)
-                    merge_analyser(aggregate, acct_analyser)
-                    logger.info(
-                        f"Account {account_id}: "
-                        f"{len(acct_analyser.athena_events)} athena events, "
-                        f"{len(acct_analyser.fetched_queries)} queries fetched"
-                    )
-                else:
-                    per_account_summaries.append(
-                        {
-                            "account_id": account_id,
-                            "error": "Failed to assume role",
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        }
-                    )
-            except Exception as e:
-                logger.error(f"Error analysing account {account_id}: {str(e)}")
-                per_account_summaries.append(
-                    {
-                        "account_id": account_id,
-                        "error": str(e),
-                        "overview": {
-                            "total_athena_events": 0,
-                            "total_s3_events": 0,
-                        },
-                    }
-                )
-            # Rate-limit: 1-second delay between accounts to avoid CloudTrail
-            # API throttling (2 req/sec limit)
-            if i < len(MONITORED_ACCOUNTS) - 1:
-                time.sleep(1)
-        aggregate.start_time = start_time
-        aggregate.end_time = end_time
-
-    else:
-        # Single-account mode — existing behaviour
-        aggregate.process_cloudtrail_events(start_time, end_time)
-        aggregate._fetch_query_strings()
-        aggregate._process_fetched_queries()
+    timed_out = _process_all_accounts(
+        aggregate, per_account_summaries, start_time, end_time,
+        context, max_accounts,
+    )
 
     try:
         aggregate.write_to_cloudwatch_logs()

@@ -21,11 +21,18 @@ CloudFormation-deployed Lambda that captures Athena usage via CloudTrail and gen
 git clone https://github.com/garnathan/Athena-Usage-Analyser.git
 cd Athena-Usage-Analyser
 python3 deploy.py           # 1. Deploy
-python3 analyse_exports.py  # 2. Analyse
-python3 cleanup.py          # 3. Cleanup (when done)
+python3 verify_setup.py     # 2. Verify (especially for org/multi-account)
+python3 analyse_exports.py  # 3. Analyse
+python3 cleanup.py          # 4. Cleanup (when done)
 ```
 
-All three scripts are interactive and guide you through each step.
+All scripts are interactive and guide you through each step.
+
+**Maintenance:** After editing `lambda/index.py`, push the update without a full CloudFormation redeploy:
+
+```bash
+python3 update_lambda.py
+```
 
 ## Deployment Modes
 
@@ -43,6 +50,8 @@ The simplest multi-account setup for customers using AWS Organizations:
 - **Cross-account roles are optional** — query strings come from CloudTrail; roles only add execution stats (data scanned, timing)
 
 Requires the collector stack to be in the management account (or delegated admin). An Organization Trail is recommended but optional.
+
+> **AWS Control Tower compatibility:** Control Tower's `BaselineCloudTrail` does **not** set `IsOrganizationTrail=true`. The deploy and verify scripts detect Control Tower trails automatically by matching multi-region trails with "controltower" in the S3 bucket name. No manual configuration needed.
 
 **Additional permissions for Org mode** (beyond the collector account permissions above):
 
@@ -108,6 +117,30 @@ aws cloudformation create-stack \
 - The collector account is always analysed locally (no cross-account role needed for itself)
 - You can deploy the cross-account roles before or after the collector stack
 
+## Verification
+
+After deploying in org or multi-account mode, run the verification script:
+
+```bash
+python3 verify_setup.py
+```
+
+This runs 9 automated checks with auto-fix capabilities:
+
+| Check | What it verifies | Auto-fixes |
+|-------|-----------------|------------|
+| 1. CloudFormation Stack | Stack exists and is healthy | — |
+| 2. Lambda Configuration | Env vars, ExternalId consistency | ExternalId mismatch between stack and StackSet |
+| 3. EventBridge Schedule | Schedule rule exists and is enabled | Re-enables disabled schedules |
+| 4. S3 Analysis Bucket | Bucket is accessible, recent exports exist | — |
+| 5. CloudTrail | Management events are being logged | — |
+| 6. Org Trail Visibility | Cross-account events via Organization Trail S3 | Auto-detects and configures org trail bucket |
+| 7. CloudWatch Logs | Recent Lambda errors or warnings | — |
+| 8. Cross-Account Roles | Roles exist and are assumable | Identifies ExternalId/role trust issues |
+| 9. Test Invocation | End-to-end Lambda invocation with short lookback | — |
+
+For Organization deployments, **always run this after `deploy.py`** — it catches configuration issues that are invisible until runtime (ExternalId mismatches, missing org trail config, disabled schedules).
+
 ## Parameters
 
 The deploy script asks for these interactively. All have sensible defaults.
@@ -151,6 +184,40 @@ The analysis script downloads these and generates an HTML report that opens in y
 - Workgroup, user, database, and table usage
 - S3 bucket access patterns
 - Migration readiness: query complexity, DDL tracking, long-running queries, concurrency, partition usage, SQL compatibility flags, and a 0-100 readiness score
+
+## Troubleshooting
+
+### AccessDenied on all accounts (ExternalId mismatch)
+
+**Symptom:** Every cross-account AssumeRole fails with `AccessDenied`, even though roles exist in all accounts.
+
+**Cause:** On re-deployment, a new `CrossAccountExternalId` UUID was generated for the CloudFormation stack, but the existing StackSet kept the old UUID. The cross-account roles trust the old ExternalId.
+
+**Fix:** Run `python3 verify_setup.py` — check 2 detects the mismatch and auto-fixes it. The deploy script now also reuses the existing ExternalId on re-deploys and updates the StackSet when it already exists.
+
+### No cross-account CloudTrail events found
+
+**Symptom:** The Lambda only returns events from the management account, not member accounts.
+
+**Cause:** The `cloudtrail:LookupEvents` API only returns events from the **calling account**, regardless of whether an Organization Trail exists. It does not return cross-account events.
+
+**Fix:** Configure an Organization Trail S3 bucket so the Lambda reads cross-account events from S3 instead. Run `python3 verify_setup.py` — check 6 auto-detects the org trail bucket and configures it.
+
+### Control Tower trail not detected
+
+**Symptom:** Deploy or verify says "no Organization Trail found" even though Control Tower is configured.
+
+**Cause:** AWS Control Tower's `BaselineCloudTrail` sets `IsMultiRegionTrail=true` but does **not** set `IsOrganizationTrail=true`, so a naive check misses it.
+
+**Fix:** Already handled — the scripts use a 3-priority detection: (1) explicit `IsOrganizationTrail`, (2) Control Tower pattern (multi-region + "controltower" in bucket name), (3) any multi-region trail.
+
+### Lambda timeout with partial or missing results
+
+**Symptom:** Lambda returns partial data or the invocation times out for large organizations (50+ accounts).
+
+**Behaviour:** The Lambda checks remaining execution time before each account and stops early with a 45-second buffer to export whatever data was collected. The response includes `"partial": true` and skipped accounts are marked in the per-account summary.
+
+**Mitigation:** The default Lambda timeout is 15 minutes (900s). For very large organizations, consider splitting monitored accounts across multiple collector stacks, or running the analysis in LOOKBACK mode with a longer time range to capture data over multiple invocations.
 
 ## Security
 
