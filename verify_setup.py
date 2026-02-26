@@ -1642,7 +1642,7 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
     console.print(
         f"  Invoking {fn_name} with 5-minute lookback..."
     )
-    console.print("  [dim]This may take several minutes for org mode (82 accounts).[/dim]")
+    console.print("  [dim]Testing with up to 5 accounts (quick check).[/dim]")
 
     # Create temp files for the payload and response
     import tempfile
@@ -1652,6 +1652,7 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
         json.dump({
             "start_time": start_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_time": end_t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "max_accounts": 5,
         }, pf)
         payload_file = pf.name
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
@@ -1662,11 +1663,11 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
             "lambda", "invoke",
             "--function-name", fn_name,
             "--payload", f"fileb://{payload_file}",
-            "--cli-read-timeout", "900",
+            "--cli-read-timeout", "300",
             output_file,
         ],
         region=region,
-        timeout=900,
+        timeout=360,
     )
 
     if not ok:

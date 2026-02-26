@@ -1192,6 +1192,9 @@ def lambda_handler(event, context):
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(minutes=LOOKBACK_MINUTES)
 
+    # Optional: limit number of accounts for quick test invocations
+    max_accounts = event.get("max_accounts", 0)  # 0 = no limit
+
     log_configuration_summary(run_mode, start_time, end_time)
 
     aggregate = AthenaUsageAnalyser()
@@ -1215,6 +1218,14 @@ def lambda_handler(event, context):
                 f"(from {len(discovered_accounts)} discovered)"
             )
             discovered_accounts = filtered
+
+        # Apply max_accounts limit (for quick test invocations)
+        if max_accounts and len(discovered_accounts) > max_accounts:
+            logger.info(
+                f"Limiting to {max_accounts} accounts (of "
+                f"{len(discovered_accounts)}) for quick test"
+            )
+            discovered_accounts = discovered_accounts[:max_accounts]
 
         use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
         if use_org_trail:
