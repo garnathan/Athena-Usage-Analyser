@@ -1183,9 +1183,21 @@ def lambda_handler(event, context):
     per_account_summaries = []
 
     if ANALYSIS_MODE == "multi" and MULTI_ACCOUNT_METHOD == "org":
-        # AWS Organizations mode: auto-discover accounts, read from org trail
+        # AWS Organizations mode: auto-discover accounts
         discovered_accounts = discover_org_accounts()
         logger.info(f"Org mode: discovered {len(discovered_accounts)} member accounts")
+
+        use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
+        if use_org_trail:
+            logger.info(
+                f"Using org trail S3 bucket: {ORG_TRAIL_BUCKET} "
+                f"(org {ORGANIZATION_ID})"
+            )
+        else:
+            logger.info(
+                "ORG_TRAIL_BUCKET or ORGANIZATION_ID not configured — "
+                "falling back to per-account CloudTrail API via AssumeRole"
+            )
 
         # Analyse the local (management) account first
         aggregate.process_cloudtrail_events(start_time, end_time)
@@ -1195,12 +1207,18 @@ def lambda_handler(event, context):
         for i, account_id in enumerate(discovered_accounts):
             logger.info(
                 f"--- Account {i + 1}/{len(discovered_accounts)}: "
-                f"{account_id} (org trail) ---"
+                f"{account_id} ---"
             )
             try:
-                acct_analyser = analyse_account_from_org_trail(
-                    account_id, start_time, end_time
-                )
+                if use_org_trail:
+                    acct_analyser = analyse_account_from_org_trail(
+                        account_id, start_time, end_time
+                    )
+                else:
+                    # Fallback: use cross-account AssumeRole + CloudTrail API
+                    acct_analyser = analyse_account(
+                        account_id, start_time, end_time
+                    )
                 if acct_analyser:
                     acct_summary = acct_analyser.generate_summary()
                     per_account_summaries.append(acct_summary)
@@ -1209,6 +1227,20 @@ def lambda_handler(event, context):
                         f"Account {account_id}: "
                         f"{len(acct_analyser.athena_events)} athena events, "
                         f"{len(acct_analyser.fetched_queries)} queries"
+                    )
+                else:
+                    logger.warning(
+                        f"Account {account_id}: no data (role not assumable?)"
+                    )
+                    per_account_summaries.append(
+                        {
+                            "account_id": account_id,
+                            "error": "Could not assume cross-account role",
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        }
                     )
             except Exception as e:
                 logger.error(f"Error analysing account {account_id}: {str(e)}")
