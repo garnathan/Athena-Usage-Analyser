@@ -3,12 +3,13 @@
 
 Reads the deploy config (.deploy_config.json) and checks:
   1. CloudFormation stack exists and is healthy
-  2. Lambda function is configured correctly
+  2. Lambda function is configured correctly (incl. config validation)
   3. EventBridge schedule rule exists
   4. S3 analysis bucket is accessible
-  5. CloudTrail is logging events
-  6. Cross-account roles exist and are assumable (multi-account/org mode)
-  7. Test invocation of the Lambda with a short lookback
+  5. CloudTrail is logging management events
+  6. Lambda CloudWatch Logs (recent errors, warnings)
+  7. Cross-account roles exist and are assumable (multi-account/org mode)
+  8. Test invocation of the Lambda with a short lookback
 """
 
 import json
@@ -219,6 +220,42 @@ def check_lambda(outputs: Dict[str, str], region: str) -> bool:
             if var == "CROSS_ACCOUNT_EXTERNAL_ID":
                 display_val = val[:4] + "****" if len(val) > 4 else "****"
             console.print(f"  [dim]  {var} = {display_val}[/dim]")
+
+    # Validate config combinations
+    analysis_mode = env.get("ANALYSIS_MODE", "single")
+    method = env.get("MULTI_ACCOUNT_METHOD", "manual")
+
+    if analysis_mode == "multi" and method == "org":
+        org_id = env.get("ORGANIZATION_ID", "")
+        org_bucket = env.get("ORG_TRAIL_BUCKET", "")
+        if not org_id:
+            console.print(
+                "  [red]✗[/red] ORGANIZATION_ID is empty but mode is org — "
+                "Lambda cannot discover accounts"
+            )
+            all_ok = False
+        if not org_bucket:
+            console.print(
+                "  [yellow]![/yellow] ORG_TRAIL_BUCKET is empty — Lambda will use "
+                "per-account CloudTrail API (slower, may miss events)"
+            )
+
+    if analysis_mode == "multi":
+        ext_id = env.get("CROSS_ACCOUNT_EXTERNAL_ID", "")
+        if not ext_id:
+            console.print(
+                "  [red]✗[/red] CROSS_ACCOUNT_EXTERNAL_ID is empty — "
+                "Lambda cannot assume cross-account roles"
+            )
+            all_ok = False
+
+    workgroups = env.get("ATHENA_WORKGROUPS", "*")
+    if workgroups and workgroups != "*":
+        wg_list = [w.strip() for w in workgroups.split(",") if w.strip()]
+        console.print(
+            f"  [yellow]![/yellow] Workgroup filter active: only [{', '.join(wg_list)}] — "
+            "queries in other workgroups will be ignored"
+        )
 
     return all_ok
 
@@ -441,8 +478,10 @@ def check_cloudtrail(region: str) -> bool:
     ok, output = run_aws(
         [
             "cloudtrail", "lookup-events",
-            "--lookup-attributes", "AttributeKey=EventSource,AttributeValue=athena.amazonaws.com",
-            "--max-results", "1",
+            "--lookup-attributes",
+            "AttributeKey=EventSource,"
+            "AttributeValue=athena.amazonaws.com",
+            "--max-results", "5",
         ],
         region=region,
     )
@@ -453,17 +492,246 @@ def check_cloudtrail(region: str) -> bool:
                 event_time = events[0].get("EventTime", "")
                 event_name = events[0].get("EventName", "")
                 console.print(
-                    f"  [green]✓[/green] Recent Athena event found: {event_name} ({event_time})"
+                    f"  [green]✓[/green] Recent Athena event: "
+                    f"{event_name} ({event_time})"
                 )
+                # Show a few event types to confirm variety
+                event_types = set(
+                    e.get("EventName", "") for e in events
+                )
+                if len(event_types) > 1:
+                    console.print(
+                        f"    Event types seen: "
+                        f"{', '.join(sorted(event_types))}"
+                    )
             else:
                 console.print(
-                    "  [yellow]![/yellow] No Athena events found in CloudTrail yet"
+                    "  [yellow]![/yellow] No Athena events in "
+                    "CloudTrail (this account)"
                 )
                 console.print(
-                    "    Run some Athena queries and wait a few minutes for events to appear."
+                    "    Run an Athena query and wait ~5 min "
+                    "for events to appear."
                 )
         except json.JSONDecodeError:
             pass
+
+    # Check org trail S3 bucket for recent CloudTrail log files
+    org_trail_bucket = ""
+    for trail in trails:
+        if trail.get("IsOrganizationTrail"):
+            org_trail_bucket = trail.get("S3BucketName", "")
+            break
+
+    if org_trail_bucket:
+        console.print()
+        console.print("  Checking org trail bucket for recent logs...")
+        # CloudTrail logs are stored at:
+        # s3://bucket/AWSLogs/{org-id}/{account-id}/CloudTrail/{region}/YYYY/MM/DD/
+        # List recent objects to confirm delivery is working
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        date_prefix = now.strftime("%Y/%m/%d")
+
+        # Try to find today's log files
+        ok, output = run_aws(
+            [
+                "s3api", "list-objects-v2",
+                "--bucket", org_trail_bucket,
+                "--prefix", f"AWSLogs/",
+                "--max-keys", "1",
+            ],
+            region=region,
+        )
+        if ok:
+            try:
+                objects = json.loads(output).get("Contents", [])
+                if objects:
+                    console.print(
+                        "  [green]✓[/green] Org trail bucket "
+                        "has CloudTrail log files"
+                    )
+                    # Check for today's logs
+                    ok2, output2 = run_aws(
+                        [
+                            "s3", "ls",
+                            f"s3://{org_trail_bucket}/AWSLogs/",
+                            "--recursive",
+                            "--summarize",
+                        ],
+                        region=region,
+                        timeout=10,
+                    )
+                    if ok2 and output2:
+                        lines = output2.strip().split("\n")
+                        # Last line is usually "Total Objects: N"
+                        for line in lines[-3:]:
+                            line = line.strip()
+                            if line.startswith("Total"):
+                                console.print(
+                                    f"    {line}"
+                                )
+                else:
+                    console.print(
+                        "  [red]✗[/red] Org trail bucket is "
+                        "empty — no log delivery"
+                    )
+                    console.print(
+                        "    Check that the org trail is "
+                        "configured to deliver to this bucket."
+                    )
+                    all_ok = False
+            except json.JSONDecodeError:
+                pass
+        else:
+            if "AccessDenied" in output:
+                console.print(
+                    "  [yellow]![/yellow] Cannot read org trail "
+                    "bucket (AccessDenied)"
+                )
+                console.print(
+                    "    The bucket policy may not allow "
+                    "this user to list objects."
+                )
+            else:
+                console.print(
+                    f"  [yellow]![/yellow] Could not check "
+                    f"org trail bucket: {output[:100]}"
+                )
+
+    return all_ok
+
+
+def check_lambda_logs(outputs: Dict[str, str], region: str) -> bool:
+    """Check 6: Lambda CloudWatch Logs — recent invocations and errors."""
+    console.print("\n[bold]6. Lambda CloudWatch Logs[/bold]")
+
+    fn_name = outputs.get("LambdaFunctionName", "")
+    if not fn_name:
+        console.print("  [red]✗[/red] No Lambda function name available")
+        return False
+
+    log_group = f"/aws/lambda/{fn_name}"
+
+    # Check if log group exists
+    ok, output = run_aws(
+        [
+            "logs", "describe-log-groups",
+            "--log-group-name-prefix", log_group,
+            "--limit", "1",
+        ],
+        region=region,
+    )
+    if not ok:
+        console.print(f"  [red]✗[/red] Could not access CloudWatch Logs: {output}")
+        return False
+
+    try:
+        groups = json.loads(output).get("logGroups", [])
+        found = any(g.get("logGroupName") == log_group for g in groups)
+    except json.JSONDecodeError:
+        found = False
+
+    if not found:
+        console.print(f"  [yellow]![/yellow] Log group not found: {log_group}")
+        console.print("    Lambda may not have been invoked yet.")
+        return True  # Not a failure — just no data yet
+
+    console.print(f"  [green]✓[/green] Log group: {log_group}")
+
+    # Get recent log events (last 30 minutes)
+    import time
+    now_ms = int(time.time() * 1000)
+    thirty_min_ago = now_ms - (30 * 60 * 1000)
+
+    ok, output = run_aws(
+        [
+            "logs", "filter-log-events",
+            "--log-group-name", log_group,
+            "--start-time", str(thirty_min_ago),
+            "--limit", "50",
+            "--interleaved",
+        ],
+        region=region,
+        timeout=30,
+    )
+
+    if not ok:
+        console.print(f"  [yellow]![/yellow] Could not read recent logs")
+        return True
+
+    try:
+        events = json.loads(output).get("events", [])
+    except json.JSONDecodeError:
+        events = []
+
+    if not events:
+        # Try last 24 hours instead
+        day_ago = now_ms - (24 * 60 * 60 * 1000)
+        ok, output = run_aws(
+            [
+                "logs", "filter-log-events",
+                "--log-group-name", log_group,
+                "--start-time", str(day_ago),
+                "--limit", "50",
+                "--interleaved",
+            ],
+            region=region,
+            timeout=30,
+        )
+        try:
+            events = json.loads(output).get("events", [])
+        except json.JSONDecodeError:
+            events = []
+
+        if not events:
+            console.print(
+                "  [yellow]![/yellow] No log events in the last 24 hours — "
+                "Lambda may not have run"
+            )
+            return True
+
+        console.print(f"  [yellow]![/yellow] No logs in last 30 min (found {len(events)} in last 24h)")
+    else:
+        console.print(f"  [green]✓[/green] Found {len(events)} log event(s) in last 30 min")
+
+    # Scan logs for key patterns
+    errors = []
+    warnings = []
+    info_lines = []
+    for evt in events:
+        msg = evt.get("message", "")
+        if "ERROR" in msg or "Traceback" in msg:
+            errors.append(msg.strip()[:200])
+        elif "WARNING: NO ATHENA EVENTS FOUND" in msg:
+            warnings.append("Lambda found no Athena events")
+        elif "WARNING: NO S3 EVENTS FOUND" in msg:
+            warnings.append("Lambda found no S3 events")
+        elif "WARNING" in msg:
+            warnings.append(msg.strip()[:200])
+        elif "Analysis completed" in msg or "events collected" in msg:
+            info_lines.append(msg.strip()[:200])
+        elif "accounts_analysed" in msg or "export_location" in msg:
+            info_lines.append(msg.strip()[:200])
+
+    if errors:
+        console.print(f"  [red]✗[/red] {len(errors)} error(s) in recent logs:")
+        for err in errors[:5]:
+            console.print(f"    [red]{err}[/red]")
+        if len(errors) > 5:
+            console.print(f"    ... and {len(errors) - 5} more")
+
+    if warnings:
+        for w in set(warnings):
+            console.print(f"  [yellow]![/yellow] {w}")
+
+    if info_lines:
+        for line in info_lines[:3]:
+            console.print(f"  [dim]  {line}[/dim]")
+
+    all_ok = len(errors) == 0
+    if all_ok and not warnings:
+        console.print(f"  [green]✓[/green] No errors in recent logs")
 
     return all_ok
 
@@ -472,7 +740,7 @@ def check_cross_account_roles(
     outputs: Dict[str, str], env: Dict[str, str], region: str,
     stack_name: str,
 ) -> bool:
-    """Check 6: Cross-account roles in remote accounts.
+    """Check 7: Cross-account roles in remote accounts.
 
     The cross-account role trusts the *Lambda execution role*, not the user
     running this script.  So instead of trying to assume the role directly
@@ -481,7 +749,7 @@ def check_cross_account_roles(
       b) Attempt assume-role via the Lambda role (chain through it)
       c) Show clear guidance when direct assume fails
     """
-    console.print("\n[bold]6. Cross-Account Roles[/bold]")
+    console.print("\n[bold]7. Cross-Account Roles[/bold]")
 
     analysis_mode = env.get("ANALYSIS_MODE", outputs.get("AnalysisMode", "single"))
     if analysis_mode == "single":
@@ -749,9 +1017,9 @@ def check_cross_account_roles(
         if acct_id not in stackset_instances
     ]
 
+    # Check if a StackSet operation is already in progress
     op_in_progress = False
     if (outdated_accounts or not_deployed_accounts) and stackset_ok:
-        # Check if a StackSet operation is already in progress
         list_ops_ok, list_ops_output = run_aws(
             [
                 "cloudformation", "list-stack-set-operations",
@@ -765,56 +1033,18 @@ def check_cross_account_roles(
                 ops = json.loads(list_ops_output).get("Summaries", [])
                 if ops and ops[0].get("Status") == "RUNNING":
                     op_in_progress = True
-                    op_id = ops[0].get("OperationId", "")
                     console.print()
                     console.print(
-                        f"  [yellow]![/yellow] A StackSet operation is already in progress"
+                        "  [yellow]![/yellow] A StackSet operation is already in progress"
                     )
                     console.print(
-                        f"    Operation: {op_id[:40]}..."
+                        "    Cannot update/create instances until it completes."
                     )
                     console.print(
-                        "    Waiting for it to complete before updating..."
+                        "    Re-run this script later to fix OUTDATED instances."
                     )
             except json.JSONDecodeError:
                 pass
-
-        if op_in_progress:
-            # Wait for the in-progress operation to finish (up to 5 minutes)
-            import time
-            waited = 0
-            max_wait = 300
-            while waited < max_wait:
-                time.sleep(15)
-                waited += 15
-                console.print(f"    [dim]Waiting... ({waited}s)[/dim]")
-                check_ok, check_output = run_aws(
-                    [
-                        "cloudformation", "list-stack-set-operations",
-                        "--stack-set-name", stackset_name,
-                        "--max-results", "1",
-                    ],
-                    region=region,
-                )
-                if check_ok:
-                    try:
-                        ops = json.loads(check_output).get("Summaries", [])
-                        if not ops or ops[0].get("Status") != "RUNNING":
-                            console.print(
-                                f"  [green]✓[/green] Previous operation completed"
-                            )
-                            op_in_progress = False
-                            break
-                    except json.JSONDecodeError:
-                        break
-
-            if op_in_progress:
-                console.print(
-                    "  [yellow]![/yellow] Previous operation still running after 5 minutes"
-                )
-                console.print(
-                    "    Re-run this script later to update OUTDATED instances."
-                )
 
     if outdated_accounts and stackset_ok and not op_in_progress:
         console.print()
@@ -986,8 +1216,8 @@ def _count_remote_athena_events(region: str, cred_env: Dict[str, str]) -> int:
 
 
 def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
-    """Check 7: Test invoke the Lambda with a short lookback."""
-    console.print("\n[bold]7. Test Lambda Invocation[/bold]")
+    """Check 8: Test invoke the Lambda with a short lookback."""
+    console.print("\n[bold]8. Test Lambda Invocation[/bold]")
 
     fn_name = outputs.get("LambdaFunctionName", "")
     if not fn_name:
@@ -999,18 +1229,19 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
     )
     console.print("  [dim]This may take up to 60 seconds.[/dim]")
 
-    # Create a temp output file path
+    # Create temp files for the payload and response
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        output_file = f.name
-
-    payload = json.dumps({"lookback_minutes": 5})
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as pf:
+        json.dump({"lookback_minutes": 5}, pf)
+        payload_file = pf.name
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
+        output_file = rf.name
 
     ok, output = run_aws(
         [
             "lambda", "invoke",
             "--function-name", fn_name,
-            "--payload", payload,
+            "--payload", f"fileb://{payload_file}",
             "--cli-read-timeout", "120",
             output_file,
         ],
@@ -1060,44 +1291,68 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
     # Show summary from response
     if isinstance(response, dict):
         body = response
-        # Lambda may return a nested body
+        # Lambda returns {statusCode, body: {...}}
         if "body" in response:
             try:
-                body = json.loads(response["body"]) if isinstance(response["body"], str) else response["body"]
+                body = (
+                    json.loads(response["body"])
+                    if isinstance(response["body"], str)
+                    else response["body"]
+                )
             except (json.JSONDecodeError, TypeError):
                 body = response
 
-        # Show accounts processed
-        accounts = body.get("accounts_processed", body.get("accounts", []))
-        if isinstance(accounts, list):
-            console.print(f"  [green]✓[/green] Accounts processed: {len(accounts)}")
-            for acct in accounts:
-                if isinstance(acct, dict):
-                    acct_id = acct.get("account_id", "unknown")
-                    events = acct.get("total_events", acct.get("events", 0))
-                    error = acct.get("error", "")
-                    if error:
-                        console.print(f"    [red]✗[/red] {acct_id}: {error}")
-                    else:
-                        console.print(f"    [green]✓[/green] {acct_id}: {events} events")
-                elif isinstance(acct, str):
-                    console.print(f"    [green]✓[/green] {acct}")
+        # Show overview (total events)
+        overview = body.get("overview", {})
+        if overview:
+            athena_evts = overview.get("total_athena_events", 0)
+            s3_evts = overview.get("total_s3_events", 0)
+            console.print(
+                f"  [green]✓[/green] Athena events: {athena_evts}"
+                f"  |  S3 events: {s3_evts}"
+            )
+            if athena_evts == 0 and s3_evts == 0:
+                console.print(
+                    "  [yellow]![/yellow] No events found in "
+                    "the 5-minute lookback window"
+                )
+                console.print(
+                    "    This is normal if no one used Athena "
+                    "recently. The scheduled Lambda uses a "
+                    "longer lookback."
+                )
 
-        # Show total events
-        total = body.get("total_events", body.get("total", ""))
-        if total:
-            console.print(f"  [green]✓[/green] Total events: {total}")
+        # Show accounts analysed (multi-account)
+        accts_analysed = body.get("accounts_analysed", "")
+        accts_succeeded = body.get("accounts_succeeded", "")
+        if accts_analysed:
+            console.print(
+                f"  [green]✓[/green] Accounts: "
+                f"{accts_succeeded}/{accts_analysed} succeeded"
+            )
+
+        # Show errors
+        errors = body.get("errors", [])
+        if errors:
+            console.print(
+                f"  [red]✗[/red] {len(errors)} error(s):"
+            )
+            for err in errors[:5]:
+                console.print(f"    [red]{err}[/red]")
 
         # Show export location
-        export = body.get("export_path", body.get("s3_path", ""))
+        export = body.get("export_location", "")
         if export:
-            console.print(f"  [green]✓[/green] Export: {export}")
+            console.print(
+                f"  [green]✓[/green] Export: {export}"
+            )
 
-    # Clean up
-    try:
-        Path(output_file).unlink()
-    except OSError:
-        pass
+    # Clean up temp files
+    for tmp in (payload_file, output_file):
+        try:
+            Path(tmp).unlink()
+        except OSError:
+            pass
 
     return True
 
@@ -1144,7 +1399,7 @@ def main():
     passed = 0
     failed = 0
     warnings = 0
-    total = 7
+    total = 8
 
     # 1. Stack
     stack_ok, outputs = check_stack(stack_name, region)
@@ -1190,14 +1445,21 @@ def main():
     else:
         failed += 1
 
-    # 6. Cross-Account Roles
+    # 6. Lambda CloudWatch Logs
+    logs_ok = check_lambda_logs(outputs, region)
+    if logs_ok:
+        passed += 1
+    else:
+        failed += 1
+
+    # 7. Cross-Account Roles
     xaccount_ok = check_cross_account_roles(outputs, env, region, stack_name)
     if xaccount_ok:
         passed += 1
     else:
         failed += 1
 
-    # 7. Test Invocation
+    # 8. Test Invocation
     invoke_ok = check_test_invocation(outputs, region)
     if invoke_ok:
         passed += 1
