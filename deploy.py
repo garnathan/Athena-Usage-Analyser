@@ -819,7 +819,83 @@ def step_org_setup(account_id: str, region: str) -> Dict:
 
     console.print(acct_table)
     console.print(
-        f"\n  [green]✓[/green] {len(member_accounts)} member accounts to analyse"
+        f"\n  [green]✓[/green] {len(member_accounts)} member account{'s' if len(member_accounts) != 1 else ''} discovered"
+    )
+
+    # Let user choose which accounts to analyse
+    console.print()
+    console.print(
+        "  [bold]1[/bold]. Analyse all discovered accounts "
+        f"[dim]({len(member_accounts)} accounts)[/dim]"
+    )
+    console.print(
+        "  [bold]2[/bold]. Select specific accounts from the list"
+    )
+    console.print(
+        "  [bold]3[/bold]. Enter account IDs manually"
+    )
+    console.print()
+
+    acct_choice = Prompt.ask(
+        "  Which accounts to analyse?", choices=["1", "2", "3"], default="1"
+    )
+
+    if acct_choice == "2":
+        # Numbered selection from discovered list
+        console.print()
+        for i, a in enumerate(member_accounts, 1):
+            name = a.get("Name", "—")
+            console.print(f"  [bold]{i:>3}[/bold]. {a['Id']}  {name}")
+        console.print()
+        while True:
+            selection = Prompt.ask(
+                "  Select accounts (comma-separated numbers, e.g. 1,3,5)"
+            )
+            try:
+                indices = [int(s.strip()) for s in selection.split(",") if s.strip()]
+                if indices and all(1 <= idx <= len(member_accounts) for idx in indices):
+                    member_accounts = [member_accounts[idx - 1] for idx in indices]
+                    break
+            except ValueError:
+                pass
+            console.print(
+                f"  [red]✗[/red] Enter numbers between 1 and {len(member_accounts)}, "
+                "separated by commas."
+            )
+        for a in member_accounts:
+            console.print(f"  [green]✓[/green] {a['Id']}  {a.get('Name', '')}")
+
+    elif acct_choice == "3":
+        # Manual entry
+        console.print()
+        while True:
+            accounts_input = Prompt.ask(
+                "  AWS account IDs [dim](comma-separated, 12-digit IDs)[/dim]"
+            )
+            manual_ids = [a.strip() for a in accounts_input.split(",") if a.strip()]
+            if not manual_ids:
+                console.print("  [red]✗[/red] At least one account ID is required.")
+                continue
+            invalid = [a for a in manual_ids if not validate_account_id(a)]
+            if invalid:
+                console.print(
+                    f"  [red]✗[/red] Invalid account IDs: {', '.join(invalid)}. "
+                    "Must be 12 digits."
+                )
+                continue
+            # Remove collector account if entered
+            manual_ids = [a for a in manual_ids if a != account_id]
+            if not manual_ids:
+                console.print("  [red]✗[/red] No remote accounts remaining.")
+                continue
+            # Convert to same format as discovered accounts
+            member_accounts = [{"Id": aid, "Name": "—"} for aid in manual_ids]
+            break
+        for a in member_accounts:
+            console.print(f"  [green]✓[/green] {a['Id']}")
+
+    console.print(
+        f"\n  [green]✓[/green] {len(member_accounts)} member account{'s' if len(member_accounts) != 1 else ''} to analyse"
     )
 
     # 3. Detect Organization Trail

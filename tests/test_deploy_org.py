@@ -134,7 +134,8 @@ def test_step_org_setup_success_with_trail():
 
 def test_step_org_setup_no_org_trail_manual_bucket():
     """Test org setup when no org trail is found — user provides bucket manually."""
-    prompt_responses = iter(["custom-trail-bucket", "ext-id-manual"])
+    # Responses: 1=all accounts, custom-trail-bucket, ext-id-manual
+    prompt_responses = iter(["1", "custom-trail-bucket", "ext-id-manual"])
 
     with patch("deploy.run_aws", side_effect=mock_run_aws_no_org_trail), \
          patch("deploy.Confirm.ask", return_value=True), \
@@ -147,7 +148,8 @@ def test_step_org_setup_no_org_trail_manual_bucket():
 
 def test_step_org_setup_no_org_trail_skip_bucket():
     """Test org setup when no org trail — user skips bucket."""
-    prompt_responses = iter(["", "ext-id-skip"])
+    # Responses: 1=all accounts, empty bucket, ext-id-skip
+    prompt_responses = iter(["1", "", "ext-id-skip"])
 
     with patch("deploy.run_aws", side_effect=mock_run_aws_no_org_trail), \
          patch("deploy.Confirm.ask", return_value=True), \
@@ -160,7 +162,8 @@ def test_step_org_setup_no_org_trail_skip_bucket():
 def test_step_org_setup_no_enrichment():
     """Test org setup when user declines cross-account enrichment."""
     with patch("deploy.run_aws", side_effect=mock_run_aws_success), \
-         patch("deploy.Confirm.ask", return_value=False):
+         patch("deploy.Confirm.ask", return_value=False), \
+         patch("deploy.Prompt.ask", return_value="1"):
         result = deploy.step_org_setup("111111111111", "eu-west-1")
 
     assert result["want_enrichment"] is False
@@ -236,7 +239,8 @@ def test_step_analysis_mode_selects_single():
 def test_suspended_accounts_excluded():
     """Test that suspended accounts are excluded from the member list."""
     with patch("deploy.run_aws", side_effect=mock_run_aws_success), \
-         patch("deploy.Confirm.ask", return_value=False):
+         patch("deploy.Confirm.ask", return_value=False), \
+         patch("deploy.Prompt.ask", return_value="1"):
         result = deploy.step_org_setup("111111111111", "eu-west-1")
 
     # Account 444444444444 is SUSPENDED, should not appear
