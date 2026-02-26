@@ -1330,10 +1330,33 @@ def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
         accts_analysed = body.get("accounts_analysed", "")
         accts_succeeded = body.get("accounts_succeeded", "")
         if accts_analysed:
-            console.print(
-                f"  [green]✓[/green] Accounts: "
-                f"{accts_succeeded}/{accts_analysed} succeeded"
-            )
+            accts_failed = int(accts_analysed) - int(accts_succeeded)
+            if int(accts_succeeded) > 0:
+                console.print(
+                    f"  [green]✓[/green] Accounts: "
+                    f"{accts_succeeded}/{accts_analysed} succeeded"
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/red] Accounts: "
+                    f"{accts_succeeded}/{accts_analysed} succeeded"
+                )
+            if accts_failed > 0:
+                acct_errors = body.get("account_errors", [])
+                if acct_errors:
+                    console.print(
+                        f"  [yellow]![/yellow] First {len(acct_errors)} "
+                        f"account failure(s):"
+                    )
+                    for ae in acct_errors:
+                        console.print(
+                            f"    Account {ae.get('account_id', '?')}: "
+                            f"[red]{ae.get('error', 'unknown')}[/red]"
+                        )
+                    if accts_failed > len(acct_errors):
+                        console.print(
+                            f"    ... and {accts_failed - len(acct_errors)} more"
+                        )
 
         # Show errors
         errors = body.get("errors", [])

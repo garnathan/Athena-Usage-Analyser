@@ -1367,9 +1367,15 @@ def lambda_handler(event, context):
         }
         if per_account_summaries:
             result["body"]["accounts_analysed"] = len(per_account_summaries)
-            result["body"]["accounts_succeeded"] = len(
-                [a for a in per_account_summaries if "error" not in a]
-            )
+            succeeded = [a for a in per_account_summaries if "error" not in a]
+            failed = [a for a in per_account_summaries if "error" in a]
+            result["body"]["accounts_succeeded"] = len(succeeded)
+            if failed:
+                # Include first 5 failures so callers can diagnose
+                result["body"]["account_errors"] = [
+                    {"account_id": a.get("account_id", "?"), "error": a["error"]}
+                    for a in failed[:5]
+                ]
         return result
     except Exception as e:
         logger.error(f"Analysis failed: {str(e)}", exc_info=True)
