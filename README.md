@@ -33,7 +33,26 @@ All three scripts are interactive and guide you through each step.
 
 Analyses Athena usage in the account where the stack is deployed. No cross-account setup needed.
 
-### 2. Multi-Account (manual)
+### 2. AWS Organizations
+
+The simplest multi-account setup for customers using AWS Organizations:
+
+- **Auto-discovers accounts** via `organizations:ListAccounts`
+- **Reads from Organization Trail** — all CloudTrail data from one S3 bucket
+- **Deploys cross-account roles via StackSets** — one command for all accounts
+- **Cross-account roles are optional** — query strings come from CloudTrail; roles only add execution stats (data scanned, timing)
+
+Requires the collector stack to be in the management account (or delegated admin). An Organization Trail is recommended but optional.
+
+**Additional permissions for Org mode** (beyond the collector account permissions above):
+
+| Permission | Why |
+|-----------|-----|
+| `organizations:ListAccounts`, `organizations:DescribeOrganization` | Discover member accounts |
+| `organizations:ListRoots` | Auto-detect root OU for StackSets |
+| `cloudformation:CreateStackSet`, `cloudformation:CreateStackInstances` | Deploy cross-account roles via StackSets |
+
+### 3. Multi-Account (manual)
 
 Analyses multiple AWS accounts via explicit account IDs and cross-account AssumeRole.
 
@@ -88,25 +107,6 @@ aws cloudformation create-stack \
 - If the role doesn't exist in an account, the Lambda logs a warning and skips that account (doesn't fail)
 - The collector account is always analysed locally (no cross-account role needed for itself)
 - You can deploy the cross-account roles before or after the collector stack
-
-### 3. AWS Organizations
-
-The simplest multi-account setup for customers using AWS Organizations:
-
-- **Auto-discovers accounts** via `organizations:ListAccounts`
-- **Reads from Organization Trail** — all CloudTrail data from one S3 bucket
-- **Deploys cross-account roles via StackSets** — one command for all accounts
-- **Cross-account roles are optional** — query strings come from CloudTrail; roles only add execution stats (data scanned, timing)
-
-Requires the collector stack to be in the management account (or delegated admin). An Organization Trail is recommended but optional.
-
-**Additional permissions for Org mode** (beyond the collector account permissions above):
-
-| Permission | Why |
-|-----------|-----|
-| `organizations:ListAccounts`, `organizations:DescribeOrganization` | Discover member accounts |
-| `organizations:ListRoots` | Auto-detect root OU for StackSets |
-| `cloudformation:CreateStackSet`, `cloudformation:CreateStackInstances` | Deploy cross-account roles via StackSets |
 
 ## Parameters
 
