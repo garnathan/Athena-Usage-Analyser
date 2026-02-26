@@ -3036,16 +3036,51 @@ def _preflight_checks() -> Dict:
     }
 
 
+def _load_deploy_config() -> Optional[Dict[str, str]]:
+    """Try to load .deploy_config.json written by deploy.py."""
+    config_path = Path(__file__).resolve().parent / ".deploy_config.json"
+    try:
+        data = json.loads(config_path.read_text())
+        if data.get("stack_name") and data.get("region"):
+            return data
+    except (OSError, json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
 def _step_find_stack(default_region: Optional[str]) -> Tuple[str, str, Dict[str, str]]:
     """Find the deployed stack. Returns (region, stack_name, outputs)."""
     console.print()
     console.print("[bold]Step 1 · Find Deployed Stack[/bold]")
     console.print()
 
-    region = Prompt.ask("  AWS Region", default=default_region or "us-east-1")
+    # Try auto-detect from deploy config first
+    deploy_config = _load_deploy_config()
+    if deploy_config:
+        stack_name = deploy_config["stack_name"]
+        region = deploy_config["region"]
+        console.print(
+            f"  Found deployment config: [bold]{stack_name}[/bold] in [cyan]{region}[/cyan]"
+        )
+        with console.status(f"  Connecting to stack [cyan]{stack_name}[/cyan]..."):
+            outputs = _get_stack_outputs(stack_name, region)
+        if outputs:
+            console.print(f"  [green]✓[/green] Stack: [bold]{stack_name}[/bold]")
+            _show_stack_info(outputs)
+            return region, stack_name, outputs
+        console.print(
+            f"  [yellow]![/yellow] Stack '{stack_name}' not found — falling back to search"
+        )
+        console.print()
+
+    # Fall back to interactive search
+    region = Prompt.ask(
+        "  AWS Region",
+        default=(deploy_config or {}).get("region") or default_region or "us-east-1",
+    )
 
     # Try default stack name first
-    default_stack = "athena-usage-analyser"
+    default_stack = (deploy_config or {}).get("stack_name") or "athena-usage-analyser"
 
     with console.status(f"  Looking for stack [cyan]{default_stack}[/cyan]..."):
         outputs = _get_stack_outputs(default_stack, region)
@@ -3341,7 +3376,7 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
         sys.exit(1)
 
     # Count downloaded files
-    zip_files = list(exports_path.rglob("*.zip"))
+    zip_files = sorted(exports_path.rglob("*.zip"))
     if not zip_files:
         console.print(
             Panel(
@@ -3358,7 +3393,32 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
         f"  [green]✓[/green] Downloaded {len(zip_files)} export{'s' if len(zip_files) != 1 else ''}"
     )
 
-    # Analyse directly
+    # Choose which exports to include in the report
+    analyse_path = exports_path
+    if len(zip_files) > 1:
+        console.print()
+        console.print(
+            "  Multiple exports found. Each export represents one Lambda run.\n"
+            "  Using only the latest export gives results for the time range you just selected.\n"
+            "  Using all exports merges data across all previous runs."
+        )
+        console.print()
+        console.print(
+            "  [bold]1[/bold]. Latest export only "
+            f"[dim]({zip_files[-1].name})[/dim]"
+        )
+        console.print(
+            f"  [bold]2[/bold]. All {len(zip_files)} exports [dim](merged)[/dim]"
+        )
+        console.print()
+        scope = Prompt.ask("  Which exports to analyse?", choices=["1", "2"], default="1")
+        if scope == "1":
+            analyse_path = zip_files[-1]
+            console.print(f"  [green]✓[/green] Using: {zip_files[-1].name}")
+        else:
+            console.print(f"  [green]✓[/green] Using all {len(zip_files)} exports")
+
+    # Analyse
     console.print()
     console.print("  Generating HTML report...")
     console.print()
@@ -3369,7 +3429,7 @@ def _step_download_and_report(region: str, outputs: Dict[str, str]) -> None:
     report_name = f"athena-usage-report-{timestamp}.html"
     report_path = reports_dir / report_name
 
-    analyser = AthenaExportAnalyser(str(exports_path))
+    analyser = AthenaExportAnalyser(str(analyse_path))
     file_count = analyser.load_exports()
 
     if file_count == 0:

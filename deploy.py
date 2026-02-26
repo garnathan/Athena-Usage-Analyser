@@ -1736,6 +1736,19 @@ def step_deploy(
         )
     )
 
+    # Save deploy config so analyse_exports.py can auto-detect the stack
+    config_path = Path(__file__).resolve().parent / ".deploy_config.json"
+    try:
+        config_path.write_text(
+            json.dumps(
+                {"stack_name": stack_name, "region": region},
+                indent=2,
+            )
+            + "\n"
+        )
+    except OSError:
+        pass  # non-critical — analyse script will fall back to interactive
+
     # Show cross-account role instructions after deployment
     if analysis_mode == "multi":
         if multi_account_method == "org" and analysis_config.get("want_enrichment"):
