@@ -49,9 +49,52 @@ LOOKBACK_MODE_DAYS = 90
 
 # Parse monitored resources
 MONITORED_WORKGROUPS = set(w.strip() for w in ATHENA_WORKGROUPS.split(",") if w.strip())
-MONITORED_S3_BUCKETS = set(
-    b.strip() for b in S3_BUCKETS_TO_MONITOR.split(",") if b.strip()
-)
+def parse_bucket_config(raw: str) -> dict:
+    """Parse S3_BUCKETS_TO_MONITOR into per-account bucket sets.
+
+    Returns dict: account_id -> set of bucket names.
+    Special key ``"*"`` is the default for accounts not explicitly listed.
+    A set containing ``"*"`` means auto-detect.
+
+    Supported formats:
+    - ``"*"``                                         -> ``{"*": {"*"}}``
+    - ``"bucket1,bucket2"``                           -> ``{"*": {"bucket1","bucket2"}}``
+    - ``'{"*":["*"],"111111111111":["b1","b2"]}'``    -> per-account mapping
+    """
+    raw = raw.strip()
+    if not raw or raw == "*":
+        return {"*": {"*"}}
+
+    # Try JSON first (per-account format)
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {
+                k: set(v) if isinstance(v, list) else {v}
+                for k, v in parsed.items()
+            }
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Legacy CSV format: treat as global default
+    buckets = set(b.strip() for b in raw.split(",") if b.strip())
+    return {"*": buckets}
+
+
+def get_account_buckets(account_id, bucket_config):
+    """Look up the monitored bucket set for a specific account.
+
+    Falls back to the ``"*"`` default key when the account has no
+    explicit entry in *bucket_config*.
+    """
+    if account_id and account_id in bucket_config:
+        return bucket_config[account_id]
+    return bucket_config.get("*", {"*"})
+
+
+BUCKET_CONFIG = parse_bucket_config(S3_BUCKETS_TO_MONITOR)
+# Legacy global set kept for logging compatibility
+MONITORED_S3_BUCKETS = BUCKET_CONFIG.get("*", set())
 
 # Parse monitored accounts
 MONITORED_ACCOUNTS = [a.strip() for a in MONITORED_ACCOUNT_IDS.split(",") if a.strip()]
@@ -196,9 +239,13 @@ def log_configuration_summary(run_mode, start_time, end_time):
     else:
         logger.info(f"Monitored Workgroups: {', '.join(sorted(MONITORED_WORKGROUPS))}")
     if "*" in MONITORED_S3_BUCKETS:
-        logger.info("Monitored S3 Buckets: AUTO-DETECT")
+        logger.info("Monitored S3 Buckets: AUTO-DETECT (default)")
     else:
-        logger.info(f"Monitored S3 Buckets: {', '.join(sorted(MONITORED_S3_BUCKETS))}")
+        logger.info(f"Monitored S3 Buckets (default): {', '.join(sorted(MONITORED_S3_BUCKETS))}")
+    for acct_id, buckets in BUCKET_CONFIG.items():
+        if acct_id != "*":
+            bkt_str = "auto-detect" if "*" in buckets else ", ".join(sorted(buckets))
+            logger.info(f"  Account {acct_id} buckets: {bkt_str}")
     if CLOUDTRAIL_BUCKET:
         logger.info(f"CloudTrail Bucket: {CLOUDTRAIL_BUCKET}")
     else:
@@ -238,12 +285,16 @@ def log_no_s3_events_warning(start_time, end_time, skipped_buckets):
     logger.warning("WARNING: NO S3 EVENTS FOUND")
     logger.warning("!" * 65)
     if "*" in MONITORED_S3_BUCKETS:
-        logger.warning("Monitored S3 Buckets: AUTO-DETECT mode")
+        logger.warning("Monitored S3 Buckets: AUTO-DETECT mode (default)")
         logger.warning("  (patterns: athena, query-results, datalake, etc.)")
     else:
         logger.warning(
-            f"Monitored S3 Buckets: {', '.join(sorted(MONITORED_S3_BUCKETS))}"
+            f"Monitored S3 Buckets (default): {', '.join(sorted(MONITORED_S3_BUCKETS))}"
         )
+    for acct_id, buckets in BUCKET_CONFIG.items():
+        if acct_id != "*":
+            bkt_str = "auto-detect" if "*" in buckets else ", ".join(sorted(buckets))
+            logger.warning(f"  Account {acct_id} buckets: {bkt_str}")
     logger.warning(f"Time Range: {start_time} to {end_time}")
     if skipped_buckets:
         logger.warning(
@@ -345,9 +396,10 @@ class AthenaUsageAnalyser:
         return workgroup in MONITORED_WORKGROUPS
 
     def should_monitor_bucket(self, bucket: str) -> bool:
-        if "*" in MONITORED_S3_BUCKETS:
+        account_buckets = get_account_buckets(self.account_id, BUCKET_CONFIG)
+        if "*" in account_buckets:
             return self._is_athena_related_bucket(bucket, "")
-        return bucket in MONITORED_S3_BUCKETS
+        return bucket in account_buckets
 
     def process_cloudtrail_events(
         self, start_time: datetime, end_time: datetime, ct_client=None, s3_cl=None
@@ -818,7 +870,9 @@ class AthenaUsageAnalyser:
             },
             "configuration": {
                 "monitored_workgroups": list(MONITORED_WORKGROUPS),
-                "monitored_s3_buckets": list(MONITORED_S3_BUCKETS),
+                "monitored_s3_buckets": {
+                    k: list(v) for k, v in BUCKET_CONFIG.items()
+                },
                 "analysis_mode": ANALYSIS_MODE,
                 "multi_account_method": MULTI_ACCOUNT_METHOD,
             },
@@ -1173,7 +1227,20 @@ def lambda_handler(event, context):
 
     elif ANALYSIS_MODE == "multi" and MONITORED_ACCOUNTS:
         # Manual multi-account mode: explicit account IDs + AssumeRole
-        logger.info(f"Multi-account mode: analysing {len(MONITORED_ACCOUNTS)} accounts")
+        # First, analyse the local (collector) account
+        logger.info(
+            f"Multi-account mode: analysing local account + "
+            f"{len(MONITORED_ACCOUNTS)} remote accounts"
+        )
+        aggregate.process_cloudtrail_events(start_time, end_time)
+        aggregate._fetch_query_strings()
+        aggregate._process_fetched_queries()
+        logger.info(
+            f"Local account: {len(aggregate.athena_events)} athena events, "
+            f"{len(aggregate.fetched_queries)} queries fetched"
+        )
+
+        # Then analyse each remote account via AssumeRole
         for i, account_id in enumerate(MONITORED_ACCOUNTS):
             logger.info(
                 f"--- Account {i + 1}/{len(MONITORED_ACCOUNTS)}: {account_id} ---"

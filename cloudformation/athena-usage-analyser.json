@@ -115,7 +115,7 @@
     },
     "S3BucketsToMonitor": {
       "Type": "String",
-      "Description": "Comma-separated list of S3 bucket names related to Athena (data lakes, results). Use '*' to auto-detect Athena-related buckets. Example: my-datalake,athena-results",
+      "Description": "S3 buckets to monitor. Use '*' for auto-detect, 'bucket1,bucket2' for all accounts, or JSON for per-account config e.g. {\"*\":[\"*\"],\"111111111111\":[\"bucketA\"]}",
       "Default": "*"
     },
     "CloudTrailBucket": {
@@ -707,7 +707,7 @@
           "Fn::Sub": "${AWS::StackName}-analyser"
         },
         "Description": "Analyzes Athena usage patterns from CloudTrail events",
-        "Runtime": "python3.14",
+        "Runtime": "python3.12",
         "Handler": "index.lambda_handler",
         "Role": {
           "Fn::GetAtt": [

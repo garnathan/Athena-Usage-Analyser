@@ -56,6 +56,143 @@ def validate_account_id(account_id: str) -> bool:
     return bool(re.match(r"^\d{12}$", account_id))
 
 
+def list_account_buckets(region: str) -> Optional[List[str]]:
+    """List S3 buckets in the local AWS account.
+
+    Returns list of bucket names on success, None on failure.
+    """
+    ok, output = run_aws(["s3api", "list-buckets"], region=region)
+    if ok:
+        return [b["Name"] for b in json.loads(output).get("Buckets", [])]
+    return None
+
+
+def select_buckets_for_account(
+    account_id: str, region: str, is_local: bool = False
+) -> List[str]:
+    """Interactively select S3 buckets for a single account.
+
+    For the local account, lists buckets and shows an interactive picker.
+    For remote accounts, prompts for manual entry or ``*`` for auto-detect.
+
+    Returns list of bucket names, or ``["*"]`` for auto-detect.
+    """
+    label = f"{account_id} (local)" if is_local else account_id
+
+    if is_local:
+        with console.status(f"  Listing buckets for {label}..."):
+            buckets = list_account_buckets(region)
+
+        if buckets is None:
+            console.print(
+                f"  [yellow]![/yellow] Could not list buckets for {label}"
+            )
+            choice = Prompt.ask(
+                "  Enter bucket names (comma-separated) or * for auto-detect",
+                default="*",
+            )
+            if choice.strip() == "*":
+                return ["*"]
+            return [b.strip() for b in choice.split(",") if b.strip()]
+
+        if not buckets:
+            console.print(f"  [yellow]![/yellow] No buckets found in {label}")
+            return ["*"]
+
+        # Show numbered list
+        console.print(f"\n  Buckets in {label}:")
+        for i, name in enumerate(buckets, 1):
+            console.print(f"  [bold]{i:>3}[/bold]. {name}")
+        console.print(f"  [bold]  *[/bold]. Auto-detect (Athena-related buckets)")
+        console.print()
+
+        while True:
+            selection = Prompt.ask(
+                "  Select buckets (comma-separated numbers, or * for auto-detect)",
+                default="*",
+            )
+            if selection.strip() == "*":
+                console.print("  [green]✓[/green] auto-detect (*)")
+                return ["*"]
+            try:
+                indices = [int(s.strip()) for s in selection.split(",") if s.strip()]
+                if indices and all(1 <= idx <= len(buckets) for idx in indices):
+                    selected = [buckets[idx - 1] for idx in indices]
+                    for b in selected:
+                        console.print(f"  [green]✓[/green] {b}")
+                    return selected
+            except ValueError:
+                pass
+            console.print(
+                f"  [red]✗[/red] Enter numbers between 1 and {len(buckets)}, or *"
+            )
+    else:
+        # Remote account — manual entry only
+        choice = Prompt.ask(
+            f"  [{label}] Bucket names (comma-separated) or * for auto-detect",
+            default="*",
+        )
+        if choice.strip() == "*":
+            console.print(f"  [green]✓[/green] {label}: auto-detect (*)")
+            return ["*"]
+        selected = [b.strip() for b in choice.split(",") if b.strip()]
+        if not selected:
+            console.print(f"  [green]✓[/green] {label}: auto-detect (*)")
+            return ["*"]
+        for b in selected:
+            console.print(f"  [green]✓[/green] {label}: {b}")
+        return selected
+
+
+def encode_bucket_config(bucket_map: Dict[str, List[str]]) -> str:
+    """Encode per-account bucket config into a CloudFormation parameter string.
+
+    Backward-compatible:
+    - If everything is auto-detect, returns ``"*"``
+    - If there is only a global default with explicit buckets, returns CSV
+    - Otherwise returns JSON
+    """
+    all_values = list(bucket_map.values())
+
+    # All auto-detect
+    if all(v == ["*"] for v in all_values):
+        return "*"
+
+    # Single global default with explicit bucket list
+    if len(bucket_map) == 1 and "*" in bucket_map:
+        buckets = bucket_map["*"]
+        if buckets == ["*"]:
+            return "*"
+        return ",".join(buckets)
+
+    # Full JSON format
+    encoded = json.dumps(bucket_map)
+    if len(encoded) > 3800:
+        console.print(
+            "  [yellow]![/yellow] Warning: bucket configuration is very large. "
+            "Consider using * (auto-detect) for some accounts."
+        )
+    return encoded
+
+
+def format_bucket_config_display(encoded: str) -> str:
+    """Format encoded bucket config for human-readable display."""
+    if encoded == "*":
+        return "auto-detect (*)"
+    try:
+        parsed = json.loads(encoded)
+        if isinstance(parsed, dict):
+            parts = []
+            for acct, buckets in parsed.items():
+                label = "default" if acct == "*" else acct
+                bkt_str = ", ".join(buckets) if buckets != ["*"] else "*"
+                parts.append(f"{label}: {bkt_str}")
+            return "; ".join(parts)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return encoded
+
+
 def package_lambda() -> bytes:
     """Package the lambda/index.py into a zip file in memory. Returns zip bytes."""
     lambda_path = SCRIPT_DIR / LAMBDA_DIR / "index.py"
@@ -177,6 +314,49 @@ def preflight_checks() -> Dict:
 
     default_region = get_default_region()
 
+    # 4. Quick permission check — verify the caller can describe CloudFormation
+    #    stacks and create S3 buckets. This catches the common case where the
+    #    customer's IAM user/role is too restricted before we get deep into the
+    #    deploy flow.
+    with console.status("Checking AWS permissions..."):
+        perm_issues = []
+        ok, _ = run_aws(["cloudformation", "list-stacks", "--max-items", "1"],
+                        region=default_region or "us-east-1")
+        if not ok:
+            perm_issues.append("cloudformation:ListStacks")
+        ok, _ = run_aws(["cloudtrail", "describe-trails"],
+                        region=default_region or "us-east-1")
+        if not ok:
+            perm_issues.append("cloudtrail:DescribeTrails")
+        ok, _ = run_aws(["s3api", "list-buckets"],
+                        region=default_region or "us-east-1")
+        if not ok:
+            perm_issues.append("s3:ListAllMyBuckets")
+
+    if perm_issues:
+        console.print(
+            Panel(
+                "[yellow]Some AWS permissions may be missing.[/yellow]\n\n"
+                "The following checks failed:\n"
+                + "\n".join(f"  • {p}" for p in perm_issues)
+                + "\n\n"
+                "The deploy script requires permissions for:\n"
+                "  • CloudFormation (create/update stacks)\n"
+                "  • S3 (create bucket, upload Lambda code)\n"
+                "  • IAM (create roles/policies — via CloudFormation)\n"
+                "  • CloudTrail (describe trails, optionally put-event-selectors)\n"
+                "  • Lambda, CloudWatch Logs, Events (via CloudFormation)\n\n"
+                "[dim]You can continue, but the deployment may fail later.[/dim]",
+                title="Permission Warning",
+                border_style="yellow",
+            )
+        )
+        if not Confirm.ask("  Continue anyway?", default=True):
+            console.print("\n[dim]Cancelled.[/dim]")
+            sys.exit(0)
+    else:
+        console.print("  [green]✓[/green] AWS permissions look good")
+
     return {
         "account_id": account_id,
         "default_region": default_region,
@@ -251,8 +431,8 @@ def step_cloudtrail(default_region: Optional[str]) -> Tuple[str, List[Dict]]:
 # ---------------------------------------------------------------------------
 
 
-def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Optional[str]]:
-    """Optionally enable S3 data events. Returns (CloudTrail bucket, monitored S3 buckets CSV) or (None, None)."""
+def step_s3_events(region: str, trails: List[Dict]) -> Optional[str]:
+    """Optionally enable S3 data events. Returns the CloudTrail bucket name or None."""
     console.print()
     console.print("[bold]Step 2 · S3 Data Events (Optional)[/bold]")
     console.print()
@@ -266,7 +446,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
         console.print(
             "\n  [dim]Skipped — S3 bucket monitoring will not be available.[/dim]"
         )
-        return None, None
+        return None
 
     # Pick trail from discovered trails
     trail_names = [t.get("Name", "") for t in trails if t.get("Name")]
@@ -274,7 +454,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
     if not trail_names:
         console.print("  [red]✗[/red] No trails available to configure.")
         console.print("  [dim]Skipping S3 data events.[/dim]")
-        return None, None
+        return None
 
     if len(trail_names) == 1:
         trail_name = trail_names[0]
@@ -345,7 +525,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
 
     if not bucket_names:
         console.print("  [red]✗[/red] No buckets provided. Skipping S3 data events.")
-        return None, None
+        return None
 
     # Build data resource ARNs
     data_resources = [f"arn:aws:s3:::{b}/" for b in bucket_names]
@@ -379,7 +559,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
     if not ok:
         console.print(f"  [red]✗[/red] Failed to enable S3 data events: {output}")
         if Confirm.ask("  Continue without S3 monitoring?", default=True):
-            return None, None
+            return None
         console.print("\n[dim]Cancelled.[/dim]")
         sys.exit(0)
 
@@ -412,7 +592,7 @@ def step_s3_events(region: str, trails: List[Dict]) -> Tuple[Optional[str], Opti
     if cloudtrail_bucket:
         console.print(f"  [green]✓[/green] CloudTrail logs bucket: {cloudtrail_bucket}")
 
-    return cloudtrail_bucket, ",".join(bucket_names)
+    return cloudtrail_bucket
 
 
 # ---------------------------------------------------------------------------
@@ -665,22 +845,166 @@ def step_org_setup(account_id: str, region: str) -> Dict:
     }
 
 
-def show_org_stacksets_instructions(
+def deploy_org_stacksets(
     account_id: str,
     stack_name: str,
     external_id: str,
     region: str,
 ) -> None:
-    """Display StackSets deployment instructions for org mode."""
+    """Deploy cross-account roles to all org member accounts via StackSets."""
     console.print()
     console.print("[bold]Cross-Account Role Setup via StackSets[/bold]")
     console.print()
     console.print(
-        "  With AWS Organizations, you can deploy the cross-account role to\n"
-        "  all member accounts at once using CloudFormation StackSets."
+        "  This will deploy a read-only IAM role to all member accounts\n"
+        "  using CloudFormation StackSets (auto-deployment enabled)."
     )
     console.print()
 
+    if not Confirm.ask("  Deploy cross-account roles now?", default=True):
+        # Fall back to showing manual instructions
+        _show_org_stacksets_manual_instructions(
+            account_id, stack_name, external_id, region
+        )
+        return
+
+    # 1. Auto-detect root OU ID
+    console.print()
+    with console.status("  Looking up Organization root OU..."):
+        ok, output = run_aws(["organizations", "list-roots"], region=region)
+
+    if not ok:
+        console.print(f"  [red]✗[/red] Failed to list organization roots: {output}")
+        console.print("  [dim]Falling back to manual instructions.[/dim]")
+        _show_org_stacksets_manual_instructions(
+            account_id, stack_name, external_id, region
+        )
+        return
+
+    roots = json.loads(output).get("Roots", [])
+    if not roots:
+        console.print("  [red]✗[/red] No organization roots found.")
+        _show_org_stacksets_manual_instructions(
+            account_id, stack_name, external_id, region
+        )
+        return
+
+    root_ou_id = roots[0].get("Id", "")
+    console.print(f"  [green]✓[/green] Root OU: {root_ou_id}")
+
+    # 2. Resolve the cross-account template path
+    cross_account_template = SCRIPT_DIR / CROSS_ACCOUNT_TEMPLATE_REL_PATH
+    if not cross_account_template.exists():
+        console.print(
+            f"  [red]✗[/red] Cross-account template not found: {cross_account_template}"
+        )
+        _show_org_stacksets_manual_instructions(
+            account_id, stack_name, external_id, region
+        )
+        return
+
+    stackset_name = "AthenaUsageAnalyserRole"
+    params = json.dumps([
+        {"ParameterKey": "CollectorAccountId", "ParameterValue": account_id},
+        {"ParameterKey": "CollectorStackName", "ParameterValue": stack_name},
+        {"ParameterKey": "ExternalId", "ParameterValue": external_id},
+    ])
+
+    # 3. Create the StackSet (or detect it already exists)
+    console.print()
+    with console.status("  Creating StackSet..."):
+        ss_ok, ss_output = run_aws(
+            [
+                "cloudformation",
+                "create-stack-set",
+                "--stack-set-name",
+                stackset_name,
+                "--template-body",
+                f"file://{cross_account_template}",
+                "--capabilities",
+                "CAPABILITY_NAMED_IAM",
+                "--permission-model",
+                "SERVICE_MANAGED",
+                "--auto-deployment",
+                "Enabled=true,RetainStacksOnAccountRemoval=false",
+                "--parameters",
+                params,
+            ],
+            region=region,
+        )
+
+    if not ss_ok:
+        if "NameAlreadyExistsException" in ss_output:
+            console.print(
+                f"  [green]✓[/green] StackSet [bold]{stackset_name}[/bold] already exists"
+            )
+        else:
+            console.print(f"  [red]✗[/red] Failed to create StackSet: {ss_output}")
+            _show_org_stacksets_manual_instructions(
+                account_id, stack_name, external_id, region
+            )
+            return
+    else:
+        console.print(
+            f"  [green]✓[/green] StackSet [bold]{stackset_name}[/bold] created"
+        )
+
+    # 4. Create stack instances in all accounts under the root OU
+    with console.status("  Deploying roles to all member accounts..."):
+        inst_ok, inst_output = run_aws(
+            [
+                "cloudformation",
+                "create-stack-instances",
+                "--stack-set-name",
+                stackset_name,
+                "--deployment-targets",
+                f"OrganizationalUnitIds={root_ou_id}",
+                "--regions",
+                region,
+            ],
+            region=region,
+        )
+
+    if not inst_ok:
+        if "OperationInProgressException" in inst_output:
+            console.print(
+                "  [yellow]![/yellow] A StackSet operation is already in progress — "
+                "roles may already be deploying."
+            )
+        elif "StackSetNotFoundException" in inst_output:
+            console.print(f"  [red]✗[/red] StackSet not found: {inst_output}")
+            return
+        else:
+            console.print(
+                f"  [red]✗[/red] Failed to create stack instances: {inst_output}"
+            )
+            return
+    else:
+        console.print(
+            "  [green]✓[/green] Stack instances deploying to all member accounts"
+        )
+
+    console.print()
+    console.print(
+        "  [dim]StackSets deployment is asynchronous — roles will be available\n"
+        "  in member accounts within a few minutes. Auto-deployment is enabled,\n"
+        "  so new accounts joining the org will automatically get the role.[/dim]"
+    )
+    console.print()
+    console.print(
+        "  [dim]To check deployment status:[/dim]\n"
+        f"  [dim]  aws cloudformation list-stack-instances --stack-set-name {stackset_name} --region {region}[/dim]"
+    )
+    console.print()
+
+
+def _show_org_stacksets_manual_instructions(
+    account_id: str,
+    stack_name: str,
+    external_id: str,
+    region: str,
+) -> None:
+    """Display manual StackSets deployment instructions as a fallback."""
     cmd = (
         f"aws cloudformation create-stack-set \\\n"
         f"  --stack-set-name AthenaUsageAnalyserRole \\\n"
@@ -699,25 +1023,21 @@ def show_org_stacksets_instructions(
         f"  --regions {region}"
     )
 
+    console.print()
     console.print(
         Panel(
             cmd,
-            title="Run in the management account",
+            title="Run these commands manually",
             border_style="cyan",
             padding=(1, 2),
         )
     )
-
     console.print()
     console.print(
         "  [dim]To find your root OU ID:[/dim]\n"
-        "  [dim]  aws organizations list-roots --query 'Roots[0].Id'[/dim]\n"
-        "\n"
-        "  [dim]Auto-deployment is enabled, so new accounts joining the org\n"
-        "  will automatically get the role deployed.[/dim]"
+        "  [dim]  aws organizations list-roots --query 'Roots[0].Id'[/dim]"
     )
     console.print()
-    Prompt.ask("  Press Enter to continue")
 
 
 def show_cross_account_instructions(
@@ -770,7 +1090,98 @@ def show_cross_account_instructions(
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Configure & Deploy
+# Step 4: S3 Bucket Selection
+# ---------------------------------------------------------------------------
+
+
+def step_bucket_selection(
+    account_id: str,
+    region: str,
+    analysis_config: Dict,
+) -> str:
+    """Select S3 buckets to monitor per account.
+
+    Returns an encoded string suitable for the ``S3BucketsToMonitor``
+    CloudFormation parameter (``"*"``, CSV, or JSON).
+    """
+    console.print()
+    console.print("[bold]Step 4 · S3 Bucket Selection[/bold]")
+    console.print()
+
+    mode = analysis_config.get("mode", "single")
+
+    if mode == "single":
+        console.print(
+            "  Select which S3 buckets the analyser should monitor.\n"
+            "  Use [bold]*[/bold] to auto-detect Athena-related buckets at runtime."
+        )
+        console.print()
+        buckets = select_buckets_for_account(account_id, region, is_local=True)
+        return encode_bucket_config({account_id: buckets})
+
+    # Multi-account mode
+    all_account_ids = [account_id] + analysis_config.get("account_ids", [])
+
+    console.print(
+        f"  {len(all_account_ids)} account{'s' if len(all_account_ids) != 1 else ''} to configure "
+        f"(1 local + {len(all_account_ids) - 1} remote)"
+    )
+    console.print()
+    console.print(
+        "  [bold]1[/bold]. Use auto-detect (*) for all accounts "
+        "[dim](recommended — detects Athena-related buckets at runtime)[/dim]"
+    )
+    console.print(
+        "  [bold]2[/bold]. Configure each account individually"
+    )
+    console.print()
+
+    approach = Prompt.ask(
+        "  How to configure S3 buckets?",
+        choices=["1", "2"],
+        default="1",
+    )
+
+    if approach == "1":
+        console.print("  [green]✓[/green] All accounts: auto-detect (*)")
+        return "*"
+
+    # Individual selection
+    bucket_map: Dict[str, List[str]] = {}
+
+    for i, acct_id in enumerate(all_account_ids):
+        is_local = acct_id == account_id
+        label = f"{acct_id} (local)" if is_local else acct_id
+        console.print(
+            f"\n  [bold]Account {i + 1}/{len(all_account_ids)}: {label}[/bold]"
+        )
+        buckets = select_buckets_for_account(acct_id, region, is_local=is_local)
+        bucket_map[acct_id] = buckets
+
+    # Show summary table
+    console.print()
+    summary_table = Table(
+        title="S3 Bucket Selection Summary",
+        box=box.ROUNDED,
+        show_edge=True,
+        pad_edge=True,
+    )
+    summary_table.add_column("Account", style="cyan")
+    summary_table.add_column("Buckets", style="white")
+
+    for acct_id in all_account_ids:
+        buckets = bucket_map.get(acct_id, ["*"])
+        bucket_str = ", ".join(buckets) if buckets != ["*"] else "auto-detect (*)"
+        label = f"{acct_id} (local)" if acct_id == account_id else acct_id
+        summary_table.add_row(label, bucket_str)
+
+    console.print(summary_table)
+
+    return encode_bucket_config(bucket_map)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Configure & Deploy
 # ---------------------------------------------------------------------------
 
 
@@ -787,7 +1198,7 @@ def step_deploy(
         analysis_config = {"mode": "single"}
 
     console.print()
-    console.print("[bold]Step 4 · Configure & Deploy[/bold]")
+    console.print("[bold]Step 5 · Configure & Deploy[/bold]")
     console.print()
 
     # Stack name
@@ -810,12 +1221,8 @@ def step_deploy(
         default="*",
     )
 
-    # S3 buckets to monitor (use selection from Step 2 if available)
-    s3_default = monitored_s3_buckets if monitored_s3_buckets else "*"
-    s3_buckets = Prompt.ask(
-        "  S3 Buckets to monitor [dim](comma-separated or \\* for auto-detect)[/dim]",
-        default=s3_default,
-    )
+    # S3 buckets to monitor (already configured in Step 4)
+    s3_buckets = monitored_s3_buckets if monitored_s3_buckets else "*"
 
     # Defaults for advanced settings
     interval = 60
@@ -863,7 +1270,7 @@ def step_deploy(
                 ", ".join(analysis_config.get("account_ids", [])),
             )
     summary.add_row("Athena Workgroups", workgroups)
-    summary.add_row("S3 Buckets to Monitor", s3_buckets)
+    summary.add_row("S3 Buckets to Monitor", format_bucket_config_display(s3_buckets))
     summary.add_row("CloudTrail Bucket", ct_bucket or "[dim]— (not set)[/dim]")
     summary.add_row(
         "Analysis Interval",
@@ -923,7 +1330,7 @@ def step_deploy(
                 ", ".join(analysis_config.get("account_ids", [])),
             )
         summary.add_row("Athena Workgroups", workgroups)
-        summary.add_row("S3 Buckets to Monitor", s3_buckets)
+        summary.add_row("S3 Buckets to Monitor", format_bucket_config_display(s3_buckets))
         summary.add_row("CloudTrail Bucket", ct_bucket or "[dim]— (not set)[/dim]")
         summary.add_row(
             "Analysis Interval",
@@ -948,26 +1355,75 @@ def step_deploy(
         stacks = json.loads(exists_output).get("Stacks", [])
         if stacks:
             status = stacks[0].get("StackStatus", "UNKNOWN")
-            console.print(
-                f"  [yellow]![/yellow] Stack [bold]{stack_name}[/bold] already exists (status: {status})"
-            )
-            console.print()
-            choice = Prompt.ask(
-                "  What would you like to do?",
-                choices=["update", "rename", "abort"],
-                default="abort",
-            )
-            if choice == "abort":
-                console.print("\n[dim]Cancelled.[/dim]")
-                sys.exit(0)
-            elif choice == "rename":
-                while True:
-                    stack_name = Prompt.ask("  New stack name")
-                    if validate_stack_name(stack_name):
-                        break
-                    console.print("  [red]✗[/red] Invalid name.")
-            elif choice == "update":
-                is_update = True
+
+            # Handle ROLLBACK_COMPLETE: stack is dead and must be deleted
+            if status == "ROLLBACK_COMPLETE":
+                console.print(
+                    f"  [yellow]![/yellow] Stack [bold]{stack_name}[/bold] is in "
+                    f"ROLLBACK_COMPLETE (a previous deployment failed)."
+                )
+                console.print()
+                console.print(
+                    "  This stack must be deleted before a new one can be created."
+                )
+                console.print()
+                choice = Prompt.ask(
+                    "  What would you like to do?",
+                    choices=["delete-and-recreate", "rename", "abort"],
+                    default="delete-and-recreate",
+                )
+                if choice == "abort":
+                    console.print("\n[dim]Cancelled.[/dim]")
+                    sys.exit(0)
+                elif choice == "rename":
+                    while True:
+                        stack_name = Prompt.ask("  New stack name")
+                        if validate_stack_name(stack_name):
+                            break
+                        console.print("  [red]✗[/red] Invalid name.")
+                elif choice == "delete-and-recreate":
+                    with console.status(f"  Deleting failed stack {stack_name}..."):
+                        del_ok, del_output = run_aws(
+                            ["cloudformation", "delete-stack",
+                             "--stack-name", stack_name],
+                            region=region,
+                        )
+                    if not del_ok:
+                        console.print(
+                            f"  [red]✗[/red] Failed to delete stack: {del_output}"
+                        )
+                        sys.exit(1)
+                    with console.status("  Waiting for delete to complete..."):
+                        run_aws(
+                            ["cloudformation", "wait", "stack-delete-complete",
+                             "--stack-name", stack_name],
+                            region=region,
+                            timeout=300,
+                        )
+                    console.print(
+                        f"  [green]✓[/green] Old stack deleted, proceeding with fresh create"
+                    )
+            else:
+                console.print(
+                    f"  [yellow]![/yellow] Stack [bold]{stack_name}[/bold] already exists (status: {status})"
+                )
+                console.print()
+                choice = Prompt.ask(
+                    "  What would you like to do?",
+                    choices=["update", "rename", "abort"],
+                    default="update",
+                )
+                if choice == "abort":
+                    console.print("\n[dim]Cancelled.[/dim]")
+                    sys.exit(0)
+                elif choice == "rename":
+                    while True:
+                        stack_name = Prompt.ask("  New stack name")
+                        if validate_stack_name(stack_name):
+                            break
+                        console.print("  [red]✗[/red] Invalid name.")
+                elif choice == "update":
+                    is_update = True
 
     # Final confirmation
     console.print()
@@ -1002,9 +1458,12 @@ def step_deploy(
             console.print("  [red]✗[/red] Could not read stack outputs.")
             sys.exit(1)
     else:
-        # Create a temporary S3 bucket for the Lambda code
-        code_bucket = f"{account_id}-{stack_name}-lambda-code-{region}"
-        # Truncate if too long (S3 bucket names max 63 chars)
+        # Create a temporary S3 bucket for the Lambda code.
+        # Include a short hash to avoid global S3 bucket name collisions.
+        import hashlib as _hl
+        bucket_hash = _hl.sha256(f"{account_id}-{region}".encode()).hexdigest()[:8]
+        code_bucket = f"{stack_name}-lambda-{bucket_hash}"
+        # S3 bucket names max 63 chars
         if len(code_bucket) > 63:
             code_bucket = code_bucket[:63].rstrip("-")
 
@@ -1077,6 +1536,28 @@ def step_deploy(
     action_label = "Updating" if is_update else "Creating"
     wait_action = "stack-update-complete" if is_update else "stack-create-complete"
 
+    # Validate template before deploying
+    with console.status("  Validating CloudFormation template..."):
+        val_ok, val_output = run_aws(
+            [
+                "cloudformation",
+                "validate-template",
+                "--template-body",
+                f"file://{template_path}",
+            ],
+            region=region,
+        )
+    if not val_ok:
+        console.print(
+            Panel(
+                f"[red]Template validation failed.[/red]\n\n{val_output}",
+                title="Template Error",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    console.print("  [green]✓[/green] Template validated")
+
     # Deploy
     console.print()
     with console.status(f"  {action_label} CloudFormation stack..."):
@@ -1108,9 +1589,9 @@ def step_deploy(
 
     console.print(f"  [green]✓[/green] Stack {action_label.lower()} initiated")
 
-    # Wait for completion
+    # Wait for completion (CFN stacks typically take 2-5 minutes)
     with console.status(
-        "  Waiting for stack to complete (this may take 2-3 minutes)..."
+        "  Waiting for stack to complete (this may take 2-5 minutes)..."
     ):
         wait_ok, wait_output = run_aws(
             [
@@ -1121,10 +1602,11 @@ def step_deploy(
                 stack_name,
             ],
             region=region,
+            timeout=600,
         )
 
     if not wait_ok:
-        # Get failure reason
+        # Get failure reason from stack status AND failed resource events
         _, desc_output = run_aws(
             ["cloudformation", "describe-stacks", "--stack-name", stack_name],
             region=region,
@@ -1138,14 +1620,44 @@ def step_deploy(
             status = "UNKNOWN"
             reason = wait_output
 
+        # Try to get the specific failed resource from stack events
+        failed_resources = []
+        ev_ok, ev_output = run_aws(
+            ["cloudformation", "describe-stack-events", "--stack-name", stack_name],
+            region=region,
+        )
+        if ev_ok:
+            try:
+                events = json.loads(ev_output).get("StackEvents", [])
+                for ev in events:
+                    if "FAILED" in ev.get("ResourceStatus", ""):
+                        failed_resources.append(
+                            f"  • {ev.get('LogicalResourceId', '?')}: "
+                            f"{ev.get('ResourceStatusReason', 'unknown')}"
+                        )
+                        if len(failed_resources) >= 5:
+                            break
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        error_lines = [
+            f"[red]Stack {action_label.lower()} failed.[/red]\n",
+            f"  Status: {status}",
+            f"  Reason: {reason}",
+        ]
+        if failed_resources:
+            error_lines.append("\n  [bold]Failed resources:[/bold]")
+            error_lines.extend(failed_resources)
+        error_lines.extend([
+            "",
+            f"To investigate further:",
+            f"  aws cloudformation describe-stack-events --stack-name {stack_name} --region {region}",
+        ])
+
         console.print(
             Panel(
-                f"[red]Stack {action_label.lower()} failed.[/red]\n\n"
-                f"  Status: {status}\n"
-                f"  Reason: {reason}\n\n"
-                f"To investigate:\n"
-                f"  aws cloudformation describe-stack-events --stack-name {stack_name} --region {region}",
-                title="Error",
+                "\n".join(error_lines),
+                title="Deployment Error",
                 border_style="red",
             )
         )
@@ -1200,7 +1712,7 @@ def step_deploy(
     # Show cross-account role instructions after deployment
     if analysis_mode == "multi":
         if multi_account_method == "org" and analysis_config.get("want_enrichment"):
-            show_org_stacksets_instructions(account_id, stack_name, external_id, region)
+            deploy_org_stacksets(account_id, stack_name, external_id, region)
         elif multi_account_method != "org":
             show_cross_account_instructions(
                 account_id,
@@ -1228,8 +1740,11 @@ def main():
 
     ctx = preflight_checks()
     region, trails = step_cloudtrail(ctx["default_region"])
-    cloudtrail_bucket, monitored_s3_buckets = step_s3_events(region, trails)
+    cloudtrail_bucket = step_s3_events(region, trails)
     analysis_config = step_analysis_mode(ctx["account_id"], region)
+    monitored_s3_buckets = step_bucket_selection(
+        ctx["account_id"], region, analysis_config
+    )
     step_deploy(
         region,
         cloudtrail_bucket,

@@ -31,13 +31,26 @@ def install_dependencies(packages: List[str]):
                     sys.exit(1)
 
 
-def run_aws(args: List[str], region: Optional[str] = None) -> Tuple[bool, str]:
-    """Run an AWS CLI command. Returns (success, stdout_or_stderr)."""
+def run_aws(
+    args: List[str],
+    region: Optional[str] = None,
+    timeout: Optional[int] = None,
+) -> Tuple[bool, str]:
+    """Run an AWS CLI command. Returns (success, stdout_or_stderr).
+
+    Args:
+        args: AWS CLI arguments (e.g. ["s3api", "list-buckets"]).
+        region: AWS region to use.
+        timeout: Command timeout in seconds (default: no timeout).
+    """
     cmd = ["aws"] + args
     if region:
         cmd += ["--region", region]
     cmd += ["--output", "json", "--no-cli-pager"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"Command timed out after {timeout}s"
     if result.returncode == 0:
         return True, result.stdout.strip()
     return False, result.stderr.strip()
