@@ -258,6 +258,133 @@ def check_lambda(outputs: Dict[str, str], region: str) -> bool:
             "queries in other workgroups will be ignored"
         )
 
+    # ---- Cross-account role trust diagnostic ----
+    if analysis_mode == "multi":
+        console.print()
+        # Get the Lambda's actual execution role ARN
+        ok_cfg, cfg_output = run_aws(
+            [
+                "lambda", "get-function-configuration",
+                "--function-name", fn_name,
+                "--query", "Role",
+                "--output", "text",
+            ],
+            region=region,
+        )
+        if ok_cfg and cfg_output.strip():
+            lambda_role_arn = cfg_output.strip()
+            # Extract role name from ARN
+            lambda_role_name = lambda_role_arn.split("/")[-1]
+            console.print(
+                f"  Lambda execution role: [cyan]{lambda_role_name}[/cyan]"
+            )
+            console.print(f"    [dim]{lambda_role_arn}[/dim]")
+
+            # Check what the StackSet expects
+            stack_name_from_outputs = outputs.get("StackName", "")
+            if not stack_name_from_outputs:
+                # Infer from role name pattern: <stack-name>-lambda-role
+                if lambda_role_name.endswith("-lambda-role"):
+                    stack_name_from_outputs = lambda_role_name[:-len("-lambda-role")]
+
+            expected_role = f"{stack_name_from_outputs}-lambda-role"
+            if lambda_role_name != expected_role:
+                console.print(
+                    f"  [red]✗[/red] Role name mismatch! "
+                    f"Lambda role is '{lambda_role_name}' but "
+                    f"StackSet expects '{expected_role}'"
+                )
+                all_ok = False
+            else:
+                console.print(
+                    f"  [green]✓[/green] Role name matches StackSet "
+                    f"trust: {expected_role}"
+                )
+
+            # Check StackSet parameters to verify match
+            ss_ok, ss_output = run_aws(
+                [
+                    "cloudformation", "describe-stack-set",
+                    "--stack-set-name", "AthenaUsageAnalyserRole",
+                ],
+                region=region,
+            )
+            if ss_ok:
+                try:
+                    ss_params = json.loads(ss_output).get(
+                        "StackSet", {}
+                    ).get("Parameters", [])
+                    ss_collector_id = ""
+                    ss_stack_name = ""
+                    ss_ext_id = ""
+                    for p in ss_params:
+                        k, v = p.get("ParameterKey", ""), p.get("ParameterValue", "")
+                        if k == "CollectorAccountId":
+                            ss_collector_id = v
+                        elif k == "CollectorStackName":
+                            ss_stack_name = v
+                        elif k == "ExternalId":
+                            ss_ext_id = v
+
+                    # Get the local account ID
+                    identity = _get_caller_identity(region)
+                    local_acct = identity.get("Account", "") if identity else ""
+
+                    ss_expected_arn = (
+                        f"arn:aws:iam::{ss_collector_id}:role/"
+                        f"{ss_stack_name}-lambda-role"
+                    )
+                    console.print()
+                    console.print(
+                        f"  StackSet trust configuration:"
+                    )
+                    console.print(
+                        f"    CollectorAccountId:  {ss_collector_id}"
+                        f"{'  [green]✓[/green]' if ss_collector_id == local_acct else '  [red]✗ mismatch![/red] local=' + local_acct}"
+                    )
+                    console.print(
+                        f"    CollectorStackName:  {ss_stack_name}"
+                    )
+                    console.print(
+                        f"    Trusted role ARN:    {ss_expected_arn}"
+                    )
+                    console.print(
+                        f"    Actual Lambda role:  {lambda_role_arn}"
+                    )
+                    if ss_expected_arn != lambda_role_arn:
+                        console.print(
+                            f"  [red]✗ MISMATCH! The cross-account "
+                            f"role will NOT trust this Lambda.[/red]"
+                        )
+                        all_ok = False
+                    else:
+                        console.print(
+                            f"  [green]✓[/green] ARNs match — trust "
+                            f"relationship is correct"
+                        )
+
+                    # Check ExternalId
+                    lambda_ext = env.get("CROSS_ACCOUNT_EXTERNAL_ID", "")
+                    if ss_ext_id and lambda_ext:
+                        if ss_ext_id == lambda_ext:
+                            console.print(
+                                f"  [green]✓[/green] ExternalId matches "
+                                f"between StackSet and Lambda"
+                            )
+                        else:
+                            console.print(
+                                f"  [red]✗ ExternalId MISMATCH![/red]"
+                            )
+                            console.print(
+                                f"    StackSet: {ss_ext_id[:4]}****"
+                            )
+                            console.print(
+                                f"    Lambda:   {lambda_ext[:4]}****"
+                            )
+                            all_ok = False
+                except json.JSONDecodeError:
+                    pass
+
     return all_ok
 
 
