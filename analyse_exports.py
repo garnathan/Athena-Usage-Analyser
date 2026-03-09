@@ -10,6 +10,7 @@ Usage:
 """
 
 import base64
+import html as html_module
 import io
 import json
 import os
@@ -2330,7 +2331,7 @@ class AthenaExportAnalyser:
                 <tr>
                     <td><strong>{error_type}</strong></td>
                     <td>{count:,}</td>
-                    <td style="font-family: monospace; font-size: 0.85em; color: #666;">{example}</td>
+                    <td style="font-family: monospace; font-size: 0.85em; color: #666;">{html_module.escape(example)}</td>
                 </tr>
 """
                 html += """
@@ -2433,7 +2434,7 @@ class AthenaExportAnalyser:
             html += f"""
             <div style="margin-bottom: 15px; padding: 12px; background: #f9f9f9; border-radius: 5px; border-left: 3px solid #007bff;">
                 <strong>#{i}</strong> - Executions: {pattern["count"]:,} | Users: {len(pattern["users"])}
-                <div class="query-example" style="white-space: pre-wrap; word-break: break-word; margin-top: 8px;">{example}</div>
+                <div class="query-example" style="white-space: pre-wrap; word-break: break-word; margin-top: 8px;">{html_module.escape(example)}</div>
             </div>
 """
         html += """

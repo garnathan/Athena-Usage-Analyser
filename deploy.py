@@ -10,10 +10,12 @@ Usage:
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 import io
@@ -1032,6 +1034,97 @@ def step_org_setup(account_id: str, region: str) -> Dict:
     }
 
 
+def _validate_stackset_prerequisites(account_id: str, region: str, use_service_managed: bool) -> list:
+    """Check whether prerequisites for StackSet deployment are met.
+
+    Returns a list of issue strings.  Empty list means all clear.
+    """
+    issues = []
+    if use_service_managed:
+        # SERVICE_MANAGED requires deploying from the management account
+        ok, org_output = run_aws(["organizations", "describe-organization"], region=region)
+        if ok:
+            org = json.loads(org_output).get("Organization", {})
+            master_id = org.get("MasterAccountId", "")
+            if master_id and master_id != account_id:
+                issues.append(
+                    f"SERVICE_MANAGED StackSets require the Organizations management "
+                    f"account ({master_id}), but you are deploying from {account_id}.\n"
+                    f"    → Switch to SELF_MANAGED mode, or deploy from the management account."
+                )
+    else:
+        # SELF_MANAGED requires an admin role
+        ok, _ = run_aws([
+            "iam", "get-role",
+            "--role-name", "AWSCloudFormationStackSetAdministrationRole",
+        ], region=region)
+        if not ok:
+            issues.append(
+                "SELF_MANAGED StackSets require AWSCloudFormationStackSetAdministrationRole.\n"
+                "    Create it: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/"
+                "stacksets-prereqs-self-managed.html"
+            )
+    return issues
+
+
+def _poll_stackset_operation(stackset_name: str, operation_id: str, region: str) -> None:
+    """Poll a StackSet operation until completion, showing per-account status."""
+    if not operation_id:
+        return
+
+    console.print()
+    with console.status("  Waiting for StackSet deployment (checking every 15s)..."):
+        final_status = "RUNNING"
+        for _attempt in range(20):  # max 5 minutes
+            time.sleep(15)
+            ok, status_output = run_aws([
+                "cloudformation", "describe-stack-set-operation",
+                "--stack-set-name", stackset_name,
+                "--operation-id", operation_id,
+            ], region=region)
+            if ok:
+                op = json.loads(status_output).get("StackSetOperation", {})
+                final_status = op.get("Status", "RUNNING")
+                if final_status in ("SUCCEEDED", "FAILED", "STOPPED"):
+                    break
+            else:
+                break
+
+    # Show per-account results
+    ok, instances_output = run_aws([
+        "cloudformation", "list-stack-instances",
+        "--stack-set-name", stackset_name,
+    ], region=region)
+
+    if ok:
+        instances = json.loads(instances_output).get("Summaries", [])
+        succeeded = [i for i in instances if i.get("Status") == "CURRENT"]
+        failed = [i for i in instances if i.get("Status") in ("OUTDATED", "INOPERABLE")]
+        pending = [i for i in instances if i.get("Status") in ("RUNNING", "PENDING")]
+
+        console.print()
+        console.print(f"  StackSet operation: [bold]{final_status}[/bold]")
+        console.print(f"  Total account instances: {len(instances)}")
+        if succeeded:
+            console.print(f"  [green]✓[/green] Succeeded: {len(succeeded)}")
+        if pending:
+            console.print(f"  [yellow]![/yellow] Still deploying: {len(pending)}")
+        if failed:
+            console.print(f"  [red]✗[/red] Failed: {len(failed)}")
+            for inst in failed[:10]:
+                console.print(
+                    f"    Account {inst.get('Account', '?')}: "
+                    f"{inst.get('StatusReason', 'Unknown reason')[:100]}"
+                )
+            if len(failed) > 10:
+                console.print(f"    ... and {len(failed) - 10} more")
+            console.print()
+            console.print(
+                "  [dim]Common causes: SCP blocks IAM, account opted out of region,\n"
+                "  StackSet execution role missing.[/dim]"
+            )
+
+
 def deploy_org_stacksets(
     account_id: str,
     stack_name: str,
@@ -1044,12 +1137,34 @@ def deploy_org_stacksets(
     console.print()
     console.print(
         "  This will deploy a read-only IAM role to all member accounts\n"
-        "  using CloudFormation StackSets (auto-deployment enabled)."
+        "  using CloudFormation StackSets.\n"
+        "\n"
+        "  [bold]Permission models:[/bold]\n"
+        "  [bold]1. SERVICE_MANAGED[/bold]  — auto-deploys to all accounts (requires management account)\n"
+        "  [bold]2. SELF_MANAGED[/bold]    — you specify target accounts (works from any account)"
     )
     console.print()
 
+    stackset_mode = Prompt.ask(
+        "  StackSet permission model",
+        choices=["1", "2"],
+        default="1",
+    )
+    use_service_managed = (stackset_mode == "1")
+
+    # Validate prerequisites before proceeding
+    issues = _validate_stackset_prerequisites(account_id, region, use_service_managed)
+    if issues:
+        for issue in issues:
+            console.print(f"  [red]✗[/red] {issue}")
+        console.print()
+        if not Confirm.ask("  Continue anyway?", default=False):
+            _show_org_stacksets_manual_instructions(
+                account_id, stack_name, external_id, region
+            )
+            return
+
     if not Confirm.ask("  Deploy cross-account roles now?", default=True):
-        # Fall back to showing manual instructions
         _show_org_stacksets_manual_instructions(
             account_id, stack_name, external_id, region
         )
@@ -1098,27 +1213,28 @@ def deploy_org_stacksets(
     ])
 
     # 3. Create the StackSet (or detect it already exists)
+    permission_model = "SERVICE_MANAGED" if use_service_managed else "SELF_MANAGED"
+    create_args = [
+        "cloudformation",
+        "create-stack-set",
+        "--stack-set-name",
+        stackset_name,
+        "--template-body",
+        f"file://{cross_account_template}",
+        "--capabilities",
+        "CAPABILITY_NAMED_IAM",
+        "--permission-model",
+        permission_model,
+        "--parameters",
+        params,
+    ]
+    if use_service_managed:
+        create_args.extend(["--auto-deployment", "Enabled=true,RetainStacksOnAccountRemoval=false"])
+
     console.print()
+    console.print(f"  Using [bold]{permission_model}[/bold] permission model")
     with console.status("  Creating StackSet..."):
-        ss_ok, ss_output = run_aws(
-            [
-                "cloudformation",
-                "create-stack-set",
-                "--stack-set-name",
-                stackset_name,
-                "--template-body",
-                f"file://{cross_account_template}",
-                "--capabilities",
-                "CAPABILITY_NAMED_IAM",
-                "--permission-model",
-                "SERVICE_MANAGED",
-                "--auto-deployment",
-                "Enabled=true,RetainStacksOnAccountRemoval=false",
-                "--parameters",
-                params,
-            ],
-            region=region,
-        )
+        ss_ok, ss_output = run_aws(create_args, region=region)
 
     if not ss_ok:
         if "NameAlreadyExistsException" in ss_output:
@@ -1192,21 +1308,45 @@ def deploy_org_stacksets(
             f"  [green]✓[/green] StackSet [bold]{stackset_name}[/bold] created"
         )
 
-    # 4. Create stack instances in all accounts under the root OU
-    with console.status("  Deploying roles to all member accounts..."):
-        inst_ok, inst_output = run_aws(
-            [
-                "cloudformation",
-                "create-stack-instances",
-                "--stack-set-name",
-                stackset_name,
-                "--deployment-targets",
-                f"OrganizationalUnitIds={root_ou_id}",
-                "--regions",
-                region,
-            ],
-            region=region,
-        )
+    # 4. Create stack instances in all accounts
+    inst_args = [
+        "cloudformation",
+        "create-stack-instances",
+        "--stack-set-name",
+        stackset_name,
+        "--regions",
+        region,
+    ]
+    if use_service_managed:
+        inst_args.extend(["--deployment-targets", f"OrganizationalUnitIds={root_ou_id}"])
+    else:
+        # SELF_MANAGED: need explicit account list
+        ok_accts, accts_output = run_aws(["organizations", "list-accounts"], region=region)
+        if ok_accts:
+            all_accounts = json.loads(accts_output).get("Accounts", [])
+            member_ids = [
+                a["Id"] for a in all_accounts
+                if a["Status"] == "ACTIVE" and a["Id"] != account_id
+            ]
+            console.print(f"  Found {len(member_ids)} active member accounts")
+        else:
+            # Fall back to monitored accounts from config
+            member_ids = [
+                a.strip()
+                for a in os.environ.get("MONITORED_ACCOUNT_IDS", "").split(",")
+                if a.strip()
+            ]
+            console.print(f"  Using {len(member_ids)} monitored account IDs from config")
+        if not member_ids:
+            console.print("  [red]✗[/red] No target accounts found")
+            _show_org_stacksets_manual_instructions(
+                account_id, stack_name, external_id, region
+            )
+            return
+        inst_args.extend(["--accounts", json.dumps(member_ids)])
+
+    with console.status("  Deploying roles to member accounts..."):
+        inst_ok, inst_output = run_aws(inst_args, region=region)
 
     if not inst_ok:
         if "OperationInProgressException" in inst_output:
@@ -1238,15 +1378,21 @@ def deploy_org_stacksets(
             return
     else:
         console.print(
-            "  [green]✓[/green] Stack instances deploying to all member accounts"
+            "  [green]✓[/green] Stack instances deploying to member accounts"
         )
+        # Extract operation ID and poll for status
+        try:
+            operation_id = json.loads(inst_output).get("OperationId", "")
+        except (json.JSONDecodeError, TypeError):
+            operation_id = ""
+        _poll_stackset_operation(stackset_name, operation_id, region)
 
     console.print()
-    console.print(
-        "  [dim]StackSets deployment is asynchronous — roles will be available\n"
-        "  in member accounts within a few minutes. Auto-deployment is enabled,\n"
-        "  so new accounts joining the org will automatically get the role.[/dim]"
-    )
+    if use_service_managed:
+        console.print(
+            "  [dim]Auto-deployment is enabled — new accounts joining the org\n"
+            "  will automatically get the role.[/dim]"
+        )
     console.print()
     console.print(
         "  [dim]To check deployment status:[/dim]\n"

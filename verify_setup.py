@@ -1631,6 +1631,144 @@ def _count_remote_athena_events(region: str, cred_env: Dict[str, str]) -> int:
         return 0
 
 
+def check_stackset_instances(region: str) -> bool:
+    """Check 10: StackSet per-account deployment status."""
+    console.print("\n[bold]10. StackSet Deployment Status[/bold]")
+
+    ok, output = run_aws([
+        "cloudformation", "list-stack-instances",
+        "--stack-set-name", "AthenaUsageAnalyserRole",
+    ], region=region)
+
+    if not ok:
+        if "StackSetNotFoundException" in output:
+            console.print(
+                "  [dim]Skipped — StackSet 'AthenaUsageAnalyserRole' not found.\n"
+                "  Cross-account roles may have been deployed manually.[/dim]"
+            )
+            return True  # Not a failure if StackSet wasn't used
+        console.print(f"  [red]✗[/red] Could not list StackSet instances: {output}")
+        return False
+
+    try:
+        instances = json.loads(output).get("Summaries", [])
+    except json.JSONDecodeError:
+        console.print("  [red]✗[/red] Could not parse StackSet instances")
+        return False
+
+    if not instances:
+        console.print("  [dim]No stack instances found (StackSet exists but is empty)[/dim]")
+        return True
+
+    succeeded = [i for i in instances if i.get("Status") == "CURRENT"]
+    failed = [i for i in instances if i.get("Status") in ("OUTDATED", "INOPERABLE")]
+    pending = [i for i in instances if i.get("Status") in ("RUNNING", "PENDING")]
+
+    console.print(f"  Total instances: {len(instances)}")
+    if succeeded:
+        console.print(f"  [green]✓[/green] Succeeded: {len(succeeded)}")
+    if pending:
+        console.print(f"  [yellow]![/yellow] Still deploying: {len(pending)}")
+    if failed:
+        console.print(f"  [red]✗[/red] Failed: {len(failed)}")
+        for inst in failed[:10]:
+            console.print(
+                f"    Account {inst.get('Account', '?')}: "
+                f"{inst.get('StatusReason', 'Unknown reason')[:100]}"
+            )
+        if len(failed) > 10:
+            console.print(f"    ... and {len(failed) - 10} more")
+        console.print()
+        console.print(
+            "  [dim]Common causes: SCP blocks IAM role creation, account opted\n"
+            "  out of the region, StackSet execution role missing.[/dim]"
+        )
+        return False
+
+    return True
+
+
+def check_parallel_config(outputs: Dict[str, str], env: Dict[str, str], region: str) -> bool:
+    """Check 11: Parallel processing and fan-out configuration."""
+    console.print("\n[bold]11. Parallel Processing Configuration[/bold]")
+
+    fn_name = outputs.get("LambdaFunctionName", "")
+    if not fn_name:
+        console.print("  [dim]Skipped — no Lambda function name[/dim]")
+        return True
+
+    max_parallel = env.get("MAX_PARALLEL_ACCOUNTS", "5")
+    fanout_enabled = env.get("FANOUT_ENABLED", "false")
+    analysis_mode = env.get("ANALYSIS_MODE", "single")
+
+    console.print(f"  MAX_PARALLEL_ACCOUNTS: {max_parallel}")
+    console.print(f"  FANOUT_ENABLED: {fanout_enabled}")
+
+    if analysis_mode != "multi":
+        console.print("  [dim]Single-account mode — parallel config not applicable[/dim]")
+        return True
+
+    ok, cfg_output = run_aws([
+        "lambda", "get-function-configuration",
+        "--function-name", fn_name,
+    ], region=region)
+    if ok:
+        try:
+            cfg = json.loads(cfg_output)
+        except json.JSONDecodeError:
+            cfg = {}
+        memory = cfg.get("MemorySize", 0)
+        timeout = cfg.get("Timeout", 0)
+        console.print(f"  Lambda memory: {memory} MB")
+        console.print(f"  Lambda timeout: {timeout}s")
+
+        all_ok = True
+        if memory < 512:
+            console.print(
+                "  [yellow]![/yellow] Memory < 512 MB — consider increasing for parallel threads"
+            )
+        if timeout < 900:
+            console.print(
+                f"  [red]✗[/red] Timeout is {timeout}s — must be 900s for multi-account mode"
+            )
+            all_ok = False
+
+        # Check Lambda self-invoke permission (needed for fan-out)
+        if fanout_enabled.lower() == "true":
+            console.print()
+            console.print("  Fan-out mode enabled — checking self-invoke permission...")
+            role_arn = cfg.get("Role", "")
+            role_name = role_arn.split("/")[-1] if role_arn else ""
+            if role_name:
+                ok2, policies_output = run_aws([
+                    "iam", "list-attached-role-policies",
+                    "--role-name", role_name,
+                ], region=region)
+                ok3, inline_output = run_aws([
+                    "iam", "list-role-policies",
+                    "--role-name", role_name,
+                ], region=region)
+                # Check if LambdaSelfInvoke policy exists
+                has_invoke = False
+                if ok3:
+                    try:
+                        policy_names = json.loads(inline_output).get("PolicyNames", [])
+                        has_invoke = "LambdaSelfInvoke" in policy_names
+                    except json.JSONDecodeError:
+                        pass
+                if has_invoke:
+                    console.print("  [green]✓[/green] Lambda self-invoke policy found")
+                else:
+                    console.print(
+                        "  [red]✗[/red] LambdaSelfInvoke policy not found on Lambda role.\n"
+                        "    Fan-out will fail. Re-deploy the stack to add this permission."
+                    )
+                    all_ok = False
+
+        return all_ok
+    return True
+
+
 def check_test_invocation(outputs: Dict[str, str], region: str) -> bool:
     """Check 9: Test invoke the Lambda with a short lookback."""
     console.print("\n[bold]9. Test Lambda Invocation[/bold]")
@@ -1869,7 +2007,7 @@ def main():
     passed = 0
     failed = 0
     warnings = 0
-    total = 9
+    total = 11
 
     # 1. Stack
     stack_ok, outputs = check_stack(stack_name, region)
@@ -1941,6 +2079,20 @@ def main():
     # 9. Test Invocation
     invoke_ok = check_test_invocation(outputs, region)
     if invoke_ok:
+        passed += 1
+    else:
+        failed += 1
+
+    # 10. StackSet Deployment Status
+    stackset_ok = check_stackset_instances(region)
+    if stackset_ok:
+        passed += 1
+    else:
+        failed += 1
+
+    # 11. Parallel Processing Configuration
+    parallel_ok = check_parallel_config(outputs, env, region)
+    if parallel_ok:
         passed += 1
     else:
         failed += 1

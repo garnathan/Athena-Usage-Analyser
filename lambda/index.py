@@ -1,5 +1,6 @@
 """Athena Usage Analyser Lambda."""
 
+import concurrent.futures
 import gzip
 import hashlib
 import io
@@ -7,7 +8,9 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+import uuid
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -43,6 +46,10 @@ MULTI_ACCOUNT_METHOD = os.environ.get(
 )  # 'manual' or 'org'
 ORGANIZATION_ID = os.environ.get("ORGANIZATION_ID", "")
 ORG_TRAIL_BUCKET = os.environ.get("ORG_TRAIL_BUCKET", "")
+MAX_PARALLEL_ACCOUNTS = int(os.environ.get("MAX_PARALLEL_ACCOUNTS", "5"))
+FANOUT_ENABLED = os.environ.get("FANOUT_ENABLED", "false").lower() == "true"
+FANOUT_THRESHOLD = int(os.environ.get("FANOUT_THRESHOLD", "10"))
+FANOUT_BATCH_SIZE = int(os.environ.get("FANOUT_BATCH_SIZE", "8"))
 
 # Lookback mode goes back 90 days (CloudTrail API limit)
 LOOKBACK_MODE_DAYS = 90
@@ -221,6 +228,87 @@ def get_cross_account_clients(account_id):
     except Exception as e:
         logger.error(f"Failed to assume role for account {account_id}: {str(e)}")
         raise AssumeRoleError(str(e)) from e
+
+
+def _classify_assume_role_error(error_str):
+    """Return a human-readable explanation for an AssumeRole failure."""
+    e = error_str.lower()
+    if "externalid" in e or "external id" in e:
+        return (
+            "ExternalId mismatch — the Lambda CROSS_ACCOUNT_EXTERNAL_ID does "
+            "not match the role trust policy. Re-run deploy.py or verify_setup.py."
+        )
+    # Check "does not exist" before generic "accessdenied" — the error
+    # message for a missing role often includes both.
+    if "nosuchentity" in e or "does not exist" in e or "cannot be found" in e:
+        return (
+            "Role not found — AthenaUsageAnalyserReadRole does not exist. "
+            "Deploy cross-account role via StackSets or manually."
+        )
+    if "accessdenied" in e or "not authorized" in e:
+        return (
+            "AccessDenied — the Lambda execution role is not trusted by "
+            "AthenaUsageAnalyserReadRole in this account. Check the role trust policy."
+        )
+    if "expired" in e or "invalid security token" in e:
+        return "Credentials expired — Lambda execution role credentials are invalid."
+    return error_str
+
+
+def _preflight_validate_roles(account_ids):
+    """Parallel STS dry-run to identify accounts with broken roles upfront.
+
+    Returns (valid_account_ids, failed_list) where failed_list contains
+    dicts with 'account_id' and 'error' keys.
+    """
+    if not account_ids:
+        return [], []
+
+    logger.info(
+        "Pre-flight: validating cross-account roles for %d accounts...",
+        len(account_ids),
+    )
+
+    valid = []
+    failed = []
+    lock = threading.Lock()
+
+    def _try_assume(account_id):
+        try:
+            get_cross_account_clients(account_id)
+            return account_id, True, None
+        except AssumeRoleError as exc:
+            return account_id, False, _classify_assume_role_error(str(exc))
+        except Exception as exc:
+            return account_id, False, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_try_assume, a): a for a in account_ids}
+        for future in concurrent.futures.as_completed(futures, timeout=60):
+            try:
+                acct_id, ok, err = future.result(timeout=30)
+                with lock:
+                    if ok:
+                        valid.append(acct_id)
+                    else:
+                        failed.append({"account_id": acct_id, "error": err})
+                        logger.warning("Pre-flight FAIL [%s]: %s", acct_id, err)
+            except Exception as exc:
+                acct_id = futures[future]
+                with lock:
+                    failed.append({
+                        "account_id": acct_id,
+                        "error": f"STS check timed out: {exc}",
+                    })
+
+    logger.info(
+        "Pre-flight complete: %d valid, %d failed", len(valid), len(failed)
+    )
+    return valid, failed
+
+
+# Thread-safety lock for merging analyser results
+_merge_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1164,7 +1252,337 @@ def _time_remaining_seconds(context):
 
 
 # Minimum seconds to reserve for export/cleanup before Lambda times out
-TIMEOUT_BUFFER_SECONDS = 45
+TIMEOUT_BUFFER_SECONDS = 90
+
+
+def _process_accounts_parallel(
+    accounts, aggregate, per_account_summaries,
+    start_time, end_time, context, use_org_trail,
+):
+    """Process a list of accounts in parallel using a thread pool.
+
+    Merges results into *aggregate* and appends to *per_account_summaries*.
+    Returns True if timed out before completing all accounts.
+    """
+    timed_out = False
+
+    def _process_one(account_id):
+        try:
+            if use_org_trail:
+                return account_id, analyse_account_from_org_trail(
+                    account_id, start_time, end_time
+                ), None
+            else:
+                return account_id, analyse_account(
+                    account_id, start_time, end_time
+                ), None
+        except AssumeRoleError as exc:
+            return account_id, None, _classify_assume_role_error(str(exc))
+        except Exception as exc:
+            logger.error("Error analysing account %s: %s", account_id, exc,
+                         exc_info=True)
+            return account_id, None, str(exc)
+
+    completed = 0
+    total = len(accounts)
+    logger.info(
+        "Processing %d accounts in parallel (max_workers=%d)",
+        total, MAX_PARALLEL_ACCOUNTS,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=MAX_PARALLEL_ACCOUNTS
+    ) as executor:
+        future_to_account = {
+            executor.submit(_process_one, acct_id): acct_id
+            for acct_id in accounts
+        }
+        for future in concurrent.futures.as_completed(future_to_account):
+            # Check timeout before processing result
+            remaining = _time_remaining_seconds(context)
+            if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+                logger.warning(
+                    "TIMEOUT approaching (%.0fs remaining) — "
+                    "processed %d/%d accounts, cancelling rest",
+                    remaining, completed, total,
+                )
+                timed_out = True
+                # Cancel pending futures (already-running ones will finish)
+                for f in future_to_account:
+                    if not f.done():
+                        f.cancel()
+                # Mark unfinished accounts as skipped
+                for f, acct_id in future_to_account.items():
+                    if f.cancelled() or (not f.done()):
+                        per_account_summaries.append({
+                            "account_id": acct_id,
+                            "error": "Skipped — Lambda timeout approaching",
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                break
+
+            try:
+                account_id, analyser, error = future.result()
+            except Exception as exc:
+                account_id = future_to_account[future]
+                error = str(exc)
+                analyser = None
+
+            completed += 1
+            if analyser:
+                with _merge_lock:
+                    merge_analyser(aggregate, analyser)
+                per_account_summaries.append(analyser.generate_summary())
+                logger.info(
+                    "[%d/%d] Account %s: %d athena events, %d queries",
+                    completed, total, account_id,
+                    len(analyser.athena_events),
+                    len(analyser.fetched_queries),
+                )
+            else:
+                per_account_summaries.append({
+                    "account_id": account_id,
+                    "error": error or "No data returned",
+                    "overview": {
+                        "total_athena_events": 0,
+                        "total_s3_events": 0,
+                    },
+                })
+                logger.warning(
+                    "[%d/%d] Account %s: %s",
+                    completed, total, account_id, error,
+                )
+
+    return timed_out
+
+
+def _trigger_fanout(accounts, start_time, end_time, aggregate,
+                    per_account_summaries, context):
+    """Self-invoke Lambda for batches of accounts when there are too many.
+
+    Returns a dict with the fanout status to be included in the response,
+    or None if fanout was not triggered / not possible.
+    """
+    lambda_client = boto3.client("lambda")
+    fn_name = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
+    if not fn_name:
+        logger.warning("FANOUT: cannot self-invoke — function name not available")
+        return None
+
+    run_id = str(uuid.uuid4())[:8]
+    batches = []
+    for i in range(0, len(accounts), FANOUT_BATCH_SIZE):
+        batches.append(accounts[i:i + FANOUT_BATCH_SIZE])
+
+    logger.info(
+        "FANOUT: splitting %d accounts into %d batches of up to %d",
+        len(accounts), len(batches), FANOUT_BATCH_SIZE,
+    )
+
+    # Invoke worker Lambdas asynchronously
+    invoked = 0
+    for batch_idx, batch in enumerate(batches):
+        payload = {
+            "_fanout_worker": True,
+            "run_id": run_id,
+            "batch_id": batch_idx,
+            "batch_accounts": batch,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+        }
+        try:
+            lambda_client.invoke(
+                FunctionName=fn_name,
+                InvocationType="Event",  # async fire-and-forget
+                Payload=json.dumps(payload),
+            )
+            invoked += 1
+            logger.info("FANOUT: invoked worker batch %d (%d accounts)",
+                        batch_idx, len(batch))
+        except Exception as exc:
+            logger.error("FANOUT: failed to invoke batch %d: %s",
+                         batch_idx, exc)
+
+    # Invoke merge Lambda
+    merge_payload = {
+        "_fanout_merge": True,
+        "run_id": run_id,
+        "expected_batches": invoked,
+        "start_time": start_time.isoformat(),
+        "end_time": end_time.isoformat(),
+    }
+    try:
+        lambda_client.invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",
+            Payload=json.dumps(merge_payload),
+        )
+        logger.info("FANOUT: invoked merge Lambda for run_id=%s", run_id)
+    except Exception as exc:
+        logger.error("FANOUT: failed to invoke merge: %s", exc)
+
+    return {
+        "fanout": True,
+        "run_id": run_id,
+        "batches_invoked": invoked,
+        "total_accounts": len(accounts),
+    }
+
+
+def _handle_fanout_worker(event, context):
+    """Process a batch of accounts as a fan-out worker."""
+    run_id = event["run_id"]
+    batch_id = event["batch_id"]
+    batch_accounts = event["batch_accounts"]
+    start_time = datetime.fromisoformat(
+        str(event["start_time"]).replace("Z", "+00:00")
+    )
+    end_time = datetime.fromisoformat(
+        str(event["end_time"]).replace("Z", "+00:00")
+    )
+
+    logger.info(
+        "FANOUT WORKER: run_id=%s batch=%d accounts=%d",
+        run_id, batch_id, len(batch_accounts),
+    )
+
+    use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
+    aggregate = AthenaUsageAnalyser()
+    per_account_summaries = []
+
+    _process_accounts_parallel(
+        batch_accounts, aggregate, per_account_summaries,
+        start_time, end_time, context, use_org_trail,
+    )
+
+    # Write partial results to S3
+    result_key = f"fanout-state/{run_id}/batch_{batch_id}.json"
+    result_payload = {
+        "batch_id": batch_id,
+        "run_id": run_id,
+        "accounts": per_account_summaries,
+        "summary": aggregate.generate_summary(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    s3_client.put_object(
+        Bucket=OUTPUT_BUCKET,
+        Key=result_key,
+        Body=json.dumps(result_payload, default=str),
+    )
+    logger.info("FANOUT WORKER: wrote results to s3://%s/%s",
+                OUTPUT_BUCKET, result_key)
+
+    return {
+        "statusCode": 200,
+        "body": {
+            "message": f"Fanout worker batch {batch_id} complete",
+            "accounts_processed": len(per_account_summaries),
+        },
+    }
+
+
+def _handle_fanout_merge(event, context):
+    """Merge results from all fan-out workers into a final export."""
+    run_id = event["run_id"]
+    expected = event["expected_batches"]
+    start_time = datetime.fromisoformat(
+        str(event["start_time"]).replace("Z", "+00:00")
+    )
+    end_time = datetime.fromisoformat(
+        str(event["end_time"]).replace("Z", "+00:00")
+    )
+
+    logger.info(
+        "FANOUT MERGE: run_id=%s expecting %d batch results", run_id, expected
+    )
+
+    # Also process the local (management) account in the merge Lambda
+    aggregate = AthenaUsageAnalyser()
+    aggregate.process_cloudtrail_events(start_time, end_time)
+    aggregate._fetch_query_strings()
+    aggregate._process_fetched_queries()
+    aggregate.start_time = start_time
+    aggregate.end_time = end_time
+
+    all_per_account = []
+
+    # Poll S3 for batch results with exponential backoff
+    prefix = f"fanout-state/{run_id}/"
+    collected = 0
+    max_wait = 720  # 12 minutes max
+    wait_interval = 15
+    elapsed = 0
+
+    while collected < expected and elapsed < max_wait:
+        remaining = _time_remaining_seconds(context)
+        if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
+            logger.warning("FANOUT MERGE: timeout approaching, exporting partial results")
+            break
+
+        try:
+            resp = s3_client.list_objects_v2(Bucket=OUTPUT_BUCKET, Prefix=prefix)
+            batch_files = [
+                o["Key"] for o in resp.get("Contents", [])
+                if o["Key"].endswith(".json")
+            ]
+            collected = len(batch_files)
+        except Exception as exc:
+            logger.error("FANOUT MERGE: error listing S3: %s", exc)
+
+        if collected < expected:
+            logger.info(
+                "FANOUT MERGE: %d/%d batches complete, waiting %ds...",
+                collected, expected, wait_interval,
+            )
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+
+    # Read and merge all batch results
+    try:
+        resp = s3_client.list_objects_v2(Bucket=OUTPUT_BUCKET, Prefix=prefix)
+        for obj in resp.get("Contents", []):
+            try:
+                batch_data = json.loads(
+                    s3_client.get_object(Bucket=OUTPUT_BUCKET, Key=obj["Key"])
+                    ["Body"].read().decode("utf-8")
+                )
+                all_per_account.extend(batch_data.get("accounts", []))
+                logger.info(
+                    "FANOUT MERGE: merged batch %s (%d accounts)",
+                    batch_data.get("batch_id", "?"),
+                    len(batch_data.get("accounts", [])),
+                )
+            except Exception as exc:
+                logger.error("FANOUT MERGE: error reading %s: %s", obj["Key"], exc)
+    except Exception as exc:
+        logger.error("FANOUT MERGE: error listing results: %s", exc)
+
+    # Export consolidated results
+    try:
+        export_location = aggregate.export_to_s3(
+            per_account_summaries=all_per_account if all_per_account else None
+        )
+        logger.info("FANOUT MERGE: export complete at %s", export_location)
+
+        return {
+            "statusCode": 200,
+            "body": {
+                "message": "Fanout merge complete",
+                "run_id": run_id,
+                "batches_merged": collected,
+                "accounts_total": len(all_per_account),
+                "export_location": export_location,
+            },
+        }
+    except Exception as exc:
+        logger.error("FANOUT MERGE: export failed: %s", exc, exc_info=True)
+        return {
+            "statusCode": 500,
+            "body": {"message": f"Fanout merge export failed: {exc}"},
+        }
 
 
 def _process_all_accounts(aggregate, per_account_summaries, start_time,
@@ -1172,14 +1590,16 @@ def _process_all_accounts(aggregate, per_account_summaries, start_time,
     """Run account processing with a safety net for partial-export on crash.
 
     Returns True if processing was cut short (timeout or error), False if
-    all accounts were processed normally.
+    all accounts were processed normally.  May return a dict instead of
+    bool when fan-out is triggered.
     """
     timed_out = False
     try:
         if ANALYSIS_MODE == "multi" and MULTI_ACCOUNT_METHOD == "org":
             # AWS Organizations mode: auto-discover accounts
             discovered_accounts = discover_org_accounts()
-            logger.info(f"Org mode: discovered {len(discovered_accounts)} member accounts")
+            logger.info("Org mode: discovered %d member accounts",
+                        len(discovered_accounts))
 
             # If MONITORED_ACCOUNT_IDS is set, filter to only those accounts
             if MONITORED_ACCOUNTS:
@@ -1188,24 +1608,24 @@ def _process_all_accounts(aggregate, per_account_summaries, start_time,
                     if a not in filtered:
                         filtered.append(a)
                 logger.info(
-                    f"Filtered to {len(filtered)} monitored accounts "
-                    f"(from {len(discovered_accounts)} discovered)"
+                    "Filtered to %d monitored accounts (from %d discovered)",
+                    len(filtered), len(discovered_accounts),
                 )
                 discovered_accounts = filtered
 
             # Apply max_accounts limit (for quick test invocations)
             if max_accounts and len(discovered_accounts) > max_accounts:
                 logger.info(
-                    f"Limiting to {max_accounts} accounts (of "
-                    f"{len(discovered_accounts)}) for quick test"
+                    "Limiting to %d accounts (of %d) for quick test",
+                    max_accounts, len(discovered_accounts),
                 )
                 discovered_accounts = discovered_accounts[:max_accounts]
 
             use_org_trail = bool(ORG_TRAIL_BUCKET and ORGANIZATION_ID)
             if use_org_trail:
                 logger.info(
-                    f"Using org trail S3 bucket: {ORG_TRAIL_BUCKET} "
-                    f"(org {ORGANIZATION_ID})"
+                    "Using org trail S3 bucket: %s (org %s)",
+                    ORG_TRAIL_BUCKET, ORGANIZATION_ID,
                 )
             else:
                 logger.info(
@@ -1214,149 +1634,105 @@ def _process_all_accounts(aggregate, per_account_summaries, start_time,
                     "Run verify_setup.py to auto-detect and configure these."
                 )
 
+            # Pre-flight: validate cross-account roles
+            # For org trail mode, roles are optional (only enrichment), so
+            # we still process all accounts but log which roles are broken.
+            if not use_org_trail and discovered_accounts:
+                valid_accounts, role_failures = _preflight_validate_roles(
+                    discovered_accounts
+                )
+                if role_failures:
+                    logger.warning(
+                        "Pre-flight: %d accounts have broken roles",
+                        len(role_failures),
+                    )
+                    for f in role_failures:
+                        per_account_summaries.append({
+                            "account_id": f["account_id"],
+                            "error": f"Pre-flight: {f['error']}",
+                            "preflight_failure": True,
+                            "overview": {
+                                "total_athena_events": 0,
+                                "total_s3_events": 0,
+                            },
+                        })
+                accounts_to_process = valid_accounts
+            else:
+                accounts_to_process = discovered_accounts
+
+            # Fan-out for very large orgs
+            if (
+                FANOUT_ENABLED
+                and len(accounts_to_process) > FANOUT_THRESHOLD
+            ):
+                # Process local account first, then fan out member accounts
+                aggregate.process_cloudtrail_events(start_time, end_time)
+                aggregate._fetch_query_strings()
+                aggregate._process_fetched_queries()
+
+                fanout_result = _trigger_fanout(
+                    accounts_to_process, start_time, end_time,
+                    aggregate, per_account_summaries, context,
+                )
+                if fanout_result:
+                    return fanout_result
+
             # Analyse the local (management) account first
             aggregate.process_cloudtrail_events(start_time, end_time)
             aggregate._fetch_query_strings()
             aggregate._process_fetched_queries()
 
-            for i, account_id in enumerate(discovered_accounts):
-                # Check if we're about to run out of time
-                remaining = _time_remaining_seconds(context)
-                if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
-                    logger.warning(
-                        f"TIMEOUT approaching ({remaining:.0f}s left) — "
-                        f"stopping after {i}/{len(discovered_accounts)} accounts "
-                        f"to save partial results"
-                    )
-                    timed_out = True
-                    for skip_id in discovered_accounts[i:]:
-                        per_account_summaries.append({
-                            "account_id": skip_id,
-                            "error": "Skipped — Lambda timeout approaching",
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        })
-                    break
-
-                logger.info(
-                    f"--- Account {i + 1}/{len(discovered_accounts)}: "
-                    f"{account_id} ---"
+            # Process member accounts in parallel
+            if accounts_to_process:
+                timed_out = _process_accounts_parallel(
+                    accounts_to_process, aggregate, per_account_summaries,
+                    start_time, end_time, context, use_org_trail,
                 )
-                try:
-                    if use_org_trail:
-                        acct_analyser = analyse_account_from_org_trail(
-                            account_id, start_time, end_time
-                        )
-                    else:
-                        acct_analyser = analyse_account(
-                            account_id, start_time, end_time
-                        )
-                    if acct_analyser:
-                        acct_summary = acct_analyser.generate_summary()
-                        per_account_summaries.append(acct_summary)
-                        merge_analyser(aggregate, acct_analyser)
-                        logger.info(
-                            f"Account {account_id}: "
-                            f"{len(acct_analyser.athena_events)} athena events, "
-                            f"{len(acct_analyser.fetched_queries)} queries"
-                        )
-                    else:
-                        logger.warning(
-                            f"Account {account_id}: no data"
-                        )
-                        per_account_summaries.append({
-                            "account_id": account_id,
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        })
-                except Exception as e:
-                    logger.error(f"Error analysing account {account_id}: {str(e)}")
-                    per_account_summaries.append({
-                        "account_id": account_id,
-                        "error": str(e),
-                        "overview": {
-                            "total_athena_events": 0,
-                            "total_s3_events": 0,
-                        },
-                    })
             aggregate.start_time = start_time
             aggregate.end_time = end_time
 
         elif ANALYSIS_MODE == "multi" and MONITORED_ACCOUNTS:
             # Manual multi-account mode: explicit account IDs + AssumeRole
             logger.info(
-                f"Multi-account mode: analysing local account + "
-                f"{len(MONITORED_ACCOUNTS)} remote accounts"
-            )
-            aggregate.process_cloudtrail_events(start_time, end_time)
-            aggregate._fetch_query_strings()
-            aggregate._process_fetched_queries()
-            logger.info(
-                f"Local account: {len(aggregate.athena_events)} athena events, "
-                f"{len(aggregate.fetched_queries)} queries fetched"
+                "Multi-account mode: analysing local account + "
+                "%d remote accounts", len(MONITORED_ACCOUNTS),
             )
 
-            for i, account_id in enumerate(MONITORED_ACCOUNTS):
-                remaining = _time_remaining_seconds(context)
-                if remaining is not None and remaining < TIMEOUT_BUFFER_SECONDS:
-                    logger.warning(
-                        f"TIMEOUT approaching ({remaining:.0f}s left) — "
-                        f"stopping after {i}/{len(MONITORED_ACCOUNTS)} accounts "
-                        f"to save partial results"
-                    )
-                    timed_out = True
-                    for skip_id in list(MONITORED_ACCOUNTS)[i:]:
-                        per_account_summaries.append({
-                            "account_id": skip_id,
-                            "error": "Skipped — Lambda timeout approaching",
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        })
-                    break
-
-                logger.info(
-                    f"--- Account {i + 1}/{len(MONITORED_ACCOUNTS)}: "
-                    f"{account_id} ---"
+            # Pre-flight: validate roles for all monitored accounts
+            valid_accounts, role_failures = _preflight_validate_roles(
+                MONITORED_ACCOUNTS
+            )
+            if role_failures:
+                logger.warning(
+                    "Pre-flight: %d accounts have broken roles",
+                    len(role_failures),
                 )
-                try:
-                    acct_analyser = analyse_account(account_id, start_time, end_time)
-                    if acct_analyser:
-                        acct_summary = acct_analyser.generate_summary()
-                        per_account_summaries.append(acct_summary)
-                        merge_analyser(aggregate, acct_analyser)
-                        logger.info(
-                            f"Account {account_id}: "
-                            f"{len(acct_analyser.athena_events)} athena events, "
-                            f"{len(acct_analyser.fetched_queries)} queries fetched"
-                        )
-                    else:
-                        per_account_summaries.append({
-                            "account_id": account_id,
-                            "error": "Failed to assume role",
-                            "overview": {
-                                "total_athena_events": 0,
-                                "total_s3_events": 0,
-                            },
-                        })
-                except Exception as e:
-                    logger.error(f"Error analysing account {account_id}: {str(e)}")
+                for f in role_failures:
                     per_account_summaries.append({
-                        "account_id": account_id,
-                        "error": str(e),
+                        "account_id": f["account_id"],
+                        "error": f"Pre-flight: {f['error']}",
+                        "preflight_failure": True,
                         "overview": {
                             "total_athena_events": 0,
                             "total_s3_events": 0,
                         },
                     })
-                # Rate-limit: 1-second delay between accounts
-                if i < len(MONITORED_ACCOUNTS) - 1:
-                    time.sleep(1)
+
+            aggregate.process_cloudtrail_events(start_time, end_time)
+            aggregate._fetch_query_strings()
+            aggregate._process_fetched_queries()
+            logger.info(
+                "Local account: %d athena events, %d queries fetched",
+                len(aggregate.athena_events),
+                len(aggregate.fetched_queries),
+            )
+
+            # Process remote accounts in parallel (only those that passed preflight)
+            if valid_accounts:
+                timed_out = _process_accounts_parallel(
+                    valid_accounts, aggregate, per_account_summaries,
+                    start_time, end_time, context, False,
+                )
             aggregate.start_time = start_time
             aggregate.end_time = end_time
 
@@ -1382,11 +1758,17 @@ def _process_all_accounts(aggregate, per_account_summaries, start_time,
 
 
 def lambda_handler(event, context):
+    # Handle fan-out sub-invocations first
+    if event.get("_fanout_worker"):
+        return _handle_fanout_worker(event, context)
+    if event.get("_fanout_merge"):
+        return _handle_fanout_merge(event, context)
+
     logger.info("Lambda invoked with mode=%s", event.get("mode", MODE))
     logger.info(
         "CONFIG: ANALYSIS_MODE=%s MULTI_ACCOUNT_METHOD=%s "
         "MONITORED_ACCOUNTS=%d ORG_TRAIL_BUCKET=%s ORGANIZATION_ID=%s "
-        "OUTPUT_BUCKET=%s TIMEOUT_BUFFER=%ds",
+        "OUTPUT_BUCKET=%s TIMEOUT_BUFFER=%ds MAX_PARALLEL=%d FANOUT=%s",
         ANALYSIS_MODE,
         MULTI_ACCOUNT_METHOD,
         len(MONITORED_ACCOUNTS),
@@ -1394,6 +1776,8 @@ def lambda_handler(event, context):
         ORGANIZATION_ID or "(not set)",
         OUTPUT_BUCKET or "(not set)",
         TIMEOUT_BUFFER_SECONDS,
+        MAX_PARALLEL_ACCOUNTS,
+        FANOUT_ENABLED,
     )
 
     run_mode = event.get("mode", MODE).upper()
@@ -1439,10 +1823,21 @@ def lambda_handler(event, context):
 
     aggregate = AthenaUsageAnalyser()
     per_account_summaries = []
-    timed_out = _process_all_accounts(
+    result = _process_all_accounts(
         aggregate, per_account_summaries, start_time, end_time,
         context, max_accounts,
     )
+
+    # Fan-out returns a dict instead of a bool — return it directly
+    if isinstance(result, dict):
+        return {
+            "statusCode": 202,
+            "body": {
+                "message": "Fan-out initiated — results will be merged asynchronously",
+                **result,
+            },
+        }
+    timed_out = result
 
     try:
         aggregate.write_to_cloudwatch_logs()
@@ -1497,12 +1892,13 @@ def lambda_handler(event, context):
             result["body"]["accounts_analysed"] = len(per_account_summaries)
             succeeded = [a for a in per_account_summaries if "error" not in a]
             failed = [a for a in per_account_summaries if "error" in a]
+            preflight_failed = sum(1 for a in failed if a.get("preflight_failure"))
             result["body"]["accounts_succeeded"] = len(succeeded)
+            result["body"]["accounts_preflight_failed"] = preflight_failed
             if failed:
-                # Include first 5 failures so callers can diagnose
                 result["body"]["account_errors"] = [
                     {"account_id": a.get("account_id", "?"), "error": a["error"]}
-                    for a in failed[:5]
+                    for a in failed[:10]
                 ]
         return result
     except Exception as e:

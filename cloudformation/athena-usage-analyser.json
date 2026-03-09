@@ -630,9 +630,17 @@
               "Sid": "WriteAnalysisOutput",
               "Effect": "Allow",
               "Action": [
-                "s3:PutObject"
+                "s3:PutObject",
+                "s3:GetObject",
+                "s3:ListBucket"
               ],
               "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "AnalysisBucket",
+                    "Arn"
+                  ]
+                },
                 {
                   "Fn::Sub": "${AnalysisBucket.Arn}/*"
                 }
@@ -758,7 +766,11 @@
             },
             "ORG_TRAIL_BUCKET": {
               "Ref": "OrgTrailBucket"
-            }
+            },
+            "MAX_PARALLEL_ACCOUNTS": "5",
+            "FANOUT_ENABLED": "false",
+            "FANOUT_THRESHOLD": "10",
+            "FANOUT_BATCH_SIZE": "8"
           }
         },
         "KmsKeyArn": {
@@ -907,6 +919,36 @@
                   "Fn::Sub": "arn:aws:s3:::${OrgTrailBucket}/AWSLogs/*"
                 }
               ]
+            }
+          ]
+        }
+      }
+    },
+    "LambdaSelfInvokePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "IsMultiAccountMode",
+      "Properties": {
+        "PolicyName": "LambdaSelfInvoke",
+        "Roles": [
+          {
+            "Ref": "LambdaExecutionRole"
+          }
+        ],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowSelfInvokeForFanout",
+              "Effect": "Allow",
+              "Action": [
+                "lambda:InvokeFunction"
+              ],
+              "Resource": {
+                "Fn::GetAtt": [
+                  "AnalyserFunction",
+                  "Arn"
+                ]
+              }
             }
           ]
         }

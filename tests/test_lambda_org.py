@@ -849,3 +849,311 @@ def test_lambda_handler_export_contains_expected_files():
         summary = json.loads(zf.read("summary.json"))
         assert "overview" in summary
         assert "configuration" in summary
+
+
+# ---------------------------------------------------------------------------
+# Error Classification Tests
+# ---------------------------------------------------------------------------
+
+
+def test_classify_assume_role_error_external_id():
+    result = index._classify_assume_role_error(
+        "An error occurred (AccessDenied) when calling the AssumeRole operation: "
+        "Not authorized to perform sts:AssumeRole. ExternalId mismatch."
+    )
+    assert "ExternalId mismatch" in result
+
+
+def test_classify_assume_role_error_access_denied():
+    result = index._classify_assume_role_error(
+        "An error occurred (AccessDenied) when calling the AssumeRole operation"
+    )
+    assert "AccessDenied" in result
+
+
+def test_classify_assume_role_error_not_found():
+    result = index._classify_assume_role_error(
+        "An error occurred (AccessDenied): role arn:aws:iam::123:role/AthenaUsageAnalyserReadRole "
+        "does not exist"
+    )
+    assert "not exist" in result.lower() or "not found" in result.lower()
+
+
+def test_classify_assume_role_error_expired():
+    result = index._classify_assume_role_error(
+        "An error occurred: The security token included in the request is expired"
+    )
+    assert "expired" in result.lower()
+
+
+def test_classify_assume_role_error_unknown():
+    result = index._classify_assume_role_error("Something completely unexpected")
+    assert result == "Something completely unexpected"
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight Role Validation Tests
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_validate_roles_empty():
+    valid, failed = index._preflight_validate_roles([])
+    assert valid == []
+    assert failed == []
+
+
+def test_preflight_validate_roles_all_succeed():
+    mock_sts = MagicMock()
+    mock_sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "AKIA...",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+        }
+    }
+
+    def mock_client(service_name, **kwargs):
+        if service_name == "sts":
+            return mock_sts
+        return MagicMock()
+
+    with patch("index.sts_client", mock_sts), \
+         patch("boto3.Session") as mock_session_cls:
+        mock_session_cls.return_value.client.return_value = MagicMock()
+        valid, failed = index._preflight_validate_roles(["111111111111", "222222222222"])
+
+    assert len(valid) == 2
+    assert len(failed) == 0
+
+
+def test_preflight_validate_roles_mixed():
+    call_count = {"n": 0}
+
+    mock_sts = MagicMock()
+    def _assume_side_effect(**kwargs):
+        call_count["n"] += 1
+        role_arn = kwargs.get("RoleArn", "")
+        if "222222222222" in role_arn:
+            raise Exception("AccessDenied: ExternalId mismatch")
+        return {
+            "Credentials": {
+                "AccessKeyId": "AKIA...",
+                "SecretAccessKey": "secret",
+                "SessionToken": "token",
+            }
+        }
+
+    mock_sts.assume_role.side_effect = _assume_side_effect
+
+    with patch("index.sts_client", mock_sts), \
+         patch("boto3.Session") as mock_session_cls:
+        mock_session_cls.return_value.client.return_value = MagicMock()
+        valid, failed = index._preflight_validate_roles(["111111111111", "222222222222"])
+
+    assert "111111111111" in valid
+    assert len(failed) == 1
+    assert failed[0]["account_id"] == "222222222222"
+    assert "ExternalId" in failed[0]["error"]
+
+
+# ---------------------------------------------------------------------------
+# Parallel Processing Tests
+# ---------------------------------------------------------------------------
+
+
+def test_process_accounts_parallel_basic():
+    """Test that parallel processing works with mocked accounts."""
+    mock_ct = MagicMock()
+    mock_ct_paginator = MagicMock()
+    mock_ct_paginator.paginate.return_value = [{"Events": []}]
+    mock_ct.get_paginator.return_value = mock_ct_paginator
+
+    mock_athena = MagicMock()
+    mock_s3 = MagicMock()
+
+    mock_sts = MagicMock()
+    mock_sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "AKIA...",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+        }
+    }
+
+    aggregate = index.AthenaUsageAnalyser()
+    per_account_summaries = []
+    start = datetime(2026, 2, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 20, 1, tzinfo=timezone.utc)
+
+    # Mock context with plenty of time remaining
+    mock_context = MagicMock()
+    mock_context.get_remaining_time_in_millis.return_value = 600000  # 10 min
+
+    with patch("index.sts_client", mock_sts), \
+         patch("boto3.Session") as mock_session_cls:
+        mock_session = MagicMock()
+        mock_session.client.side_effect = lambda svc: {
+            "cloudtrail": mock_ct,
+            "athena": mock_athena,
+            "s3": mock_s3,
+        }.get(svc, MagicMock())
+        mock_session_cls.return_value = mock_session
+
+        timed_out = index._process_accounts_parallel(
+            ["111111111111", "222222222222"],
+            aggregate, per_account_summaries,
+            start, end, mock_context, False,
+        )
+
+    assert not timed_out
+    assert len(per_account_summaries) == 2
+
+
+def test_process_accounts_parallel_timeout():
+    """Test that parallel processing handles timeout gracefully."""
+    mock_ct = MagicMock()
+    mock_ct_paginator = MagicMock()
+    mock_ct_paginator.paginate.return_value = [{"Events": []}]
+    mock_ct.get_paginator.return_value = mock_ct_paginator
+
+    mock_sts = MagicMock()
+    mock_sts.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "AKIA...",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+        }
+    }
+
+    aggregate = index.AthenaUsageAnalyser()
+    per_account_summaries = []
+    start = datetime(2026, 2, 20, tzinfo=timezone.utc)
+    end = datetime(2026, 2, 20, 1, tzinfo=timezone.utc)
+
+    # Context returns very little time remaining
+    mock_context = MagicMock()
+    mock_context.get_remaining_time_in_millis.return_value = 5000  # 5 seconds
+
+    with patch("index.sts_client", mock_sts), \
+         patch("boto3.Session") as mock_session_cls:
+        mock_session_cls.return_value.client.return_value = MagicMock()
+
+        timed_out = index._process_accounts_parallel(
+            ["111111111111", "222222222222", "333333333333"],
+            aggregate, per_account_summaries,
+            start, end, mock_context, False,
+        )
+
+    # Should have timed out (context returns only 5s, buffer is 90s)
+    assert timed_out
+
+
+# ---------------------------------------------------------------------------
+# Fan-out Routing Tests
+# ---------------------------------------------------------------------------
+
+
+def test_lambda_handler_fanout_worker_routing():
+    """Test that _fanout_worker events route to the worker handler."""
+    with patch("index._handle_fanout_worker", return_value={"statusCode": 200}) as mock_worker:
+        result = index.lambda_handler(
+            {"_fanout_worker": True, "run_id": "test", "batch_id": 0,
+             "batch_accounts": ["111"], "start_time": "2026-02-20T00:00:00Z",
+             "end_time": "2026-02-20T01:00:00Z"},
+            None,
+        )
+    mock_worker.assert_called_once()
+    assert result["statusCode"] == 200
+
+
+def test_lambda_handler_fanout_merge_routing():
+    """Test that _fanout_merge events route to the merge handler."""
+    with patch("index._handle_fanout_merge", return_value={"statusCode": 200}) as mock_merge:
+        result = index.lambda_handler(
+            {"_fanout_merge": True, "run_id": "test", "expected_batches": 2,
+             "start_time": "2026-02-20T00:00:00Z",
+             "end_time": "2026-02-20T01:00:00Z"},
+            None,
+        )
+    mock_merge.assert_called_once()
+    assert result["statusCode"] == 200
+
+
+def test_lambda_handler_normal_event_not_routed_to_fanout():
+    """Test that normal events are NOT routed to fanout handlers."""
+    mock_ct = MagicMock()
+    mock_ct_paginator = MagicMock()
+    mock_ct_paginator.paginate.return_value = [{"Events": []}]
+    mock_ct.get_paginator.return_value = mock_ct_paginator
+
+    mock_s3 = MagicMock()
+    mock_s3.put_object.return_value = {}
+    mock_logs = MagicMock()
+    mock_logs.create_log_stream.return_value = {}
+    mock_logs.put_log_events.return_value = {}
+
+    with patch("index.ANALYSIS_MODE", "single"), \
+         patch("index.s3_client", mock_s3), \
+         patch("index.logs_client", mock_logs), \
+         patch("index.cloudtrail_client", mock_ct), \
+         patch("index.athena_client", MagicMock()), \
+         patch("index._get_account_id", return_value="123456789012"), \
+         patch("index._get_region", return_value="eu-west-1"), \
+         patch("index._handle_fanout_worker") as mock_worker, \
+         patch("index._handle_fanout_merge") as mock_merge:
+        result = index.lambda_handler(
+            {"start_time": "2026-02-20T00:00:00Z",
+             "end_time": "2026-02-20T01:00:00Z"},
+            None,
+        )
+    mock_worker.assert_not_called()
+    mock_merge.assert_not_called()
+    assert result["statusCode"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Preflight in Lambda Response Tests
+# ---------------------------------------------------------------------------
+
+
+def test_lambda_handler_multi_account_preflight_failures_in_response():
+    """Test that preflight failures appear in the Lambda response."""
+    mock_ct = MagicMock()
+    mock_ct_paginator = MagicMock()
+    mock_ct_paginator.paginate.return_value = [{"Events": []}]
+    mock_ct.get_paginator.return_value = mock_ct_paginator
+
+    mock_s3 = MagicMock()
+    mock_s3.put_object.return_value = {}
+    mock_logs = MagicMock()
+    mock_logs.create_log_stream.return_value = {}
+    mock_logs.put_log_events.return_value = {}
+
+    # Make preflight fail for one account
+    with patch("index.ANALYSIS_MODE", "multi"), \
+         patch("index.MULTI_ACCOUNT_METHOD", "manual"), \
+         patch("index.MONITORED_ACCOUNTS", ["111111111111", "222222222222"]), \
+         patch("index.s3_client", mock_s3), \
+         patch("index.logs_client", mock_logs), \
+         patch("index.cloudtrail_client", mock_ct), \
+         patch("index.athena_client", MagicMock()), \
+         patch("index._get_account_id", return_value="000000000000"), \
+         patch("index._get_region", return_value="eu-west-1"), \
+         patch("index._preflight_validate_roles") as mock_preflight:
+        mock_preflight.return_value = (
+            ["111111111111"],  # valid
+            [{"account_id": "222222222222", "error": "Role not found"}],  # failed
+        )
+        result = index.lambda_handler(
+            {"start_time": "2026-02-20T00:00:00Z",
+             "end_time": "2026-02-20T01:00:00Z"},
+            None,
+        )
+
+    assert result["statusCode"] == 200
+    body = result["body"]
+    assert body.get("accounts_preflight_failed", 0) >= 1
+    # Check the failed account appears in errors
+    errors = body.get("account_errors", [])
+    failed_ids = [e["account_id"] for e in errors]
+    assert "222222222222" in failed_ids
